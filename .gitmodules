@@ -1,0 +1,3 @@
+[submodule "NaVid-VLN-CE"]
+	path = NaVid-VLN-CE
+	url = git@github.com:jzhzhang/NaVid-VLN-CE.git
