@@ -149,9 +149,12 @@ class DataArguments:
     use_omninav_waypoint: bool = field(default=False)
     omninav_data_base_path: Optional[str] = field(default=None)
     omninav_video_base_path: Optional[str] = field(default=None)
-    omninav_instruction_type: Optional[str] = field(default="original")
+    omninav_instruction_types: Optional[str] = field(default=None)  # Comma-separated list or None for all
     omninav_agent_types: Optional[str] = field(default="human,car,dog")
     omninav_max_frames: Optional[int] = field(default=32)
+    omninav_video_fps: Optional[int] = field(default=30)
+    omninav_num_future_waypoints: Optional[int] = field(default=5)
+    omninav_waypoint_stride: Optional[int] = field(default=5)
 
 
 @dataclass
@@ -247,7 +250,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att']
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att', 'waypoint_head']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -1405,14 +1408,20 @@ def train():
             )
 
         agent_types = [x.strip() for x in data_args.omninav_agent_types.split(",") if x.strip()]
+        # Parse instruction_types: None means all types, otherwise split by comma
+        instruction_types = None
+        if data_args.omninav_instruction_types is not None:
+            instruction_types = [x.strip() for x in data_args.omninav_instruction_types.split(",") if x.strip()]
+
         omninav_data_args = OmniNavDataArguments(
             data_base_path=data_args.omninav_data_base_path,
             video_base_path=data_args.omninav_video_base_path,
-            instruction_type=data_args.omninav_instruction_type,
+            instruction_types=instruction_types,
             agent_types=agent_types,
-            video_fps=data_args.video_fps,
+            video_fps=data_args.omninav_video_fps,
             max_frames=data_args.omninav_max_frames,
-            num_future_waypoints=model_args.num_waypoints,
+            num_future_waypoints=data_args.omninav_num_future_waypoints,
+            waypoint_stride=data_args.omninav_waypoint_stride,
             image_processor=data_args.image_processor,
             mm_use_im_start_end=data_args.mm_use_im_start_end,
             is_multimodal=True,

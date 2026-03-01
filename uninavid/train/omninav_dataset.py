@@ -32,7 +32,7 @@ class OmniNavDataArguments:
     """Arguments for OmniNavBench dataset."""
     data_base_path: str = None  # Base path for JSON trajectory data
     video_base_path: str = None  # Base path for video files
-    instruction_type: str = "original"  # original, concise, verbose, first_person
+    instruction_types: List[str] = None  # ['original', 'concise', 'verbose', 'first_person'] or None for all
     agent_types: List[str] = None  # ['human', 'car', 'dog'] or subset
     video_fps: int = 30  # Target video FPS
     max_frames: int = 32  # Maximum number of frames to sample
@@ -65,7 +65,9 @@ def compute_relative_waypoints(
     current_idx: int,
     num_future: int = 5,
     units_in_meters: float = 1.0,
-    stride: int = 5
+    stride: int = 5,
+    goal_position: np.ndarray = None,
+    success_radius: float = 0.5
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute relative waypoints from current position.
@@ -77,17 +79,24 @@ def compute_relative_waypoints(
         units_in_meters: Scale factor to convert coordinates to meters
                          (e.g., 0.01 means coordinates are in cm)
         stride: Stride for sampling future waypoints (e.g., stride=5 means 5, 10, 15, 20, 25)
+        goal_position: [2] or [3] array of goal position (x, y) or (x, y, z) in original units
+        success_radius: Distance threshold (in meters) to consider as arrived
 
     Returns:
         relative_positions: [num_future, 2] array of (dx, dy) in meters
         relative_yaws: [num_future, 2] array of (sin, cos) of relative yaw
-        arrive_labels: [num_future] array of arrive labels (1 if last waypoint)
+        arrive_labels: [num_future] array of arrive labels (1 if within success_radius of goal)
     """
     current_wp = waypoints[current_idx]
     # Apply unit conversion to get meters
     current_xyz = np.array(current_wp['xyz'][:2]) * units_in_meters  # Only x, y
     current_yaw = np.deg2rad(current_wp['yaw_deg'])
-    
+
+    # Convert goal position to meters if provided
+    goal_xy = None
+    if goal_position is not None:
+        goal_xy = np.array(goal_position[:2]) * units_in_meters
+
     # Rotation matrix to convert to robot-centric coordinates
     cos_yaw = np.cos(-current_yaw)
     sin_yaw = np.sin(-current_yaw)
@@ -95,13 +104,13 @@ def compute_relative_waypoints(
         [cos_yaw, -sin_yaw],
         [sin_yaw, cos_yaw]
     ])
-    
+
     relative_positions = []
     relative_yaws = []
     arrive_labels = []
-    
+
     total_waypoints = len(waypoints)
-    
+
     for i in range(num_future):
         future_idx = current_idx + (i + 1) * stride  # Use stride for sampling
 
@@ -110,28 +119,33 @@ def compute_relative_waypoints(
             # Apply unit conversion to get meters
             future_xyz = np.array(future_wp['xyz'][:2]) * units_in_meters
             future_yaw = np.deg2rad(future_wp['yaw_deg'])
-            
+
             # Compute relative position in robot-centric frame
             delta_pos = future_xyz - current_xyz
             relative_pos = rotation_matrix @ delta_pos
-            
+
             # Compute relative yaw
             relative_yaw = future_yaw - current_yaw
             # Normalize to [-pi, pi]
             relative_yaw = np.arctan2(np.sin(relative_yaw), np.cos(relative_yaw))
-            
+
             relative_positions.append(relative_pos)
             relative_yaws.append([np.sin(relative_yaw), np.cos(relative_yaw)])
-            
-            # Arrive label: 1 if this is the last waypoint
-            is_last = (future_idx == total_waypoints - 1)
-            arrive_labels.append(1.0 if is_last else 0.0)
+
+            # Arrive label: based on distance to goal
+            if goal_xy is not None:
+                dist_to_goal = np.linalg.norm(future_xyz - goal_xy)
+                is_arrived = dist_to_goal < success_radius
+            else:
+                # Fallback: use last waypoint as arrive indicator
+                is_arrived = (future_idx == total_waypoints - 1)
+            arrive_labels.append(1.0 if is_arrived else 0.0)
         else:
             # Pad with zeros if we've reached the end
             relative_positions.append([0.0, 0.0])
             relative_yaws.append([0.0, 1.0])  # sin=0, cos=1 means no rotation
-            arrive_labels.append(1.0)  # Mark as arrived
-    
+            arrive_labels.append(1.0)  # Mark as arrived (past trajectory end)
+
     return (
         np.array(relative_positions, dtype=np.float32),
         np.array(relative_yaws, dtype=np.float32),
@@ -159,54 +173,57 @@ class OmniNavBenchDataset(Dataset):
         """Build list of all training samples."""
         samples = []
         missing_video_count = 0
-        
+
         agent_types = self.data_args.agent_types or ['human', 'car', 'dog']
-        instruction_type = self.data_args.instruction_type
-        
+        # Load all instruction types if not specified
+        instruction_types = self.data_args.instruction_types or ['original', 'concise', 'verbose', 'first_person']
+
         data_base = self.data_args.data_base_path
         video_base = self.data_args.video_base_path
-        
-        for agent_type in agent_types:
-            agent_data_path = os.path.join(data_base, instruction_type, agent_type)
-            agent_video_path = os.path.join(video_base, agent_type)
-            
-            if not os.path.exists(agent_data_path):
-                print(f"Warning: {agent_data_path} does not exist, skipping...")
-                continue
-            
-            # Iterate through scenes
-            for scene in os.listdir(agent_data_path):
-                scene_data_path = os.path.join(agent_data_path, scene)
-                scene_video_path = os.path.join(agent_video_path, scene)
-                
-                if not os.path.isdir(scene_data_path):
+
+        for instruction_type in instruction_types:
+            for agent_type in agent_types:
+                agent_data_path = os.path.join(data_base, instruction_type, agent_type)
+                agent_video_path = os.path.join(video_base, agent_type)
+
+                if not os.path.exists(agent_data_path):
+                    print(f"Warning: {agent_data_path} does not exist, skipping...")
                     continue
-                
-                # Iterate through episodes
-                for json_file in os.listdir(scene_data_path):
-                    if not json_file.endswith('.json'):
+
+                # Iterate through scenes
+                for scene in os.listdir(agent_data_path):
+                    scene_data_path = os.path.join(agent_data_path, scene)
+                    scene_video_path = os.path.join(agent_video_path, scene)
+
+                    if not os.path.isdir(scene_data_path):
                         continue
-                    
-                    json_path = os.path.join(scene_data_path, json_file)
-                    episode_name = json_file.replace('.json', '')
-                    video_dir = os.path.join(scene_video_path, episode_name)
-                    rgb_video_path = os.path.join(video_dir, 'rgb.mp4')
-                    depth_video_path = os.path.join(video_dir, 'depth.mp4')
-                    
-                    # Check if video exists
-                    if not os.path.exists(rgb_video_path):
-                        missing_video_count += 1
-                        continue
-                    
-                    samples.append({
-                        'json_path': json_path,
-                        'rgb_video_path': rgb_video_path,
-                        'depth_video_path': depth_video_path,
-                        'agent_type': agent_type,
-                        'scene': scene,
-                        'episode': episode_name,
-                    })
-        
+
+                    # Iterate through episodes
+                    for json_file in os.listdir(scene_data_path):
+                        if not json_file.endswith('.json'):
+                            continue
+
+                        json_path = os.path.join(scene_data_path, json_file)
+                        episode_name = json_file.replace('.json', '')
+                        video_dir = os.path.join(scene_video_path, episode_name)
+                        rgb_video_path = os.path.join(video_dir, 'rgb.mp4')
+                        depth_video_path = os.path.join(video_dir, 'depth.mp4')
+
+                        # Check if video exists
+                        if not os.path.exists(rgb_video_path):
+                            missing_video_count += 1
+                            continue
+
+                        samples.append({
+                            'json_path': json_path,
+                            'rgb_video_path': rgb_video_path,
+                            'depth_video_path': depth_video_path,
+                            'agent_type': agent_type,
+                            'scene': scene,
+                            'episode': episode_name,
+                            'instruction_type': instruction_type,  # Track which instruction type
+                        })
+
         if missing_video_count > 0:
             print(f"OmniNavBenchDataset: skipped {missing_video_count} samples without rgb.mp4")
 
@@ -235,7 +252,27 @@ class OmniNavBenchDataset(Dataset):
         if entries:
             return entries[0].get('rb_gt_waypoints', [])
         return []
-    
+
+    def _get_goal_info(self, data: dict) -> Tuple[Optional[np.ndarray], float]:
+        """
+        Extract goal position and success radius from data.
+
+        Returns:
+            goal_position: [3] array of (x, y, z) in original units, or None if not found
+            success_radius: Success radius in meters (default 0.5)
+        """
+        task = data['scenarios'][0].get('task', {})
+        navigation = task.get('navigation', {})
+
+        goal_position = navigation.get('goal_position', None)
+        if goal_position is not None:
+            goal_position = np.array(goal_position, dtype=np.float32)
+
+        # success_radius is typically in meters already
+        success_radius = navigation.get('success_radius', 0.5)
+
+        return goal_position, success_radius
+
     def _sample_training_point(
         self,
         waypoints: List[dict],
@@ -315,82 +352,101 @@ class OmniNavBenchDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a training sample."""
-        sample = self.samples[idx]
+        max_retries = 10
+        for retry in range(max_retries):
+            try:
+                # Use a different sample on retry
+                actual_idx = (idx + retry) % len(self.samples)
+                sample = self.samples[actual_idx]
 
-        # Load trajectory data
-        data = self._load_trajectory_data(sample['json_path'])
-        instruction = self._get_instruction(data)
-        waypoints = self._get_waypoints(data)
+                # Load trajectory data
+                data = self._load_trajectory_data(sample['json_path'])
+                instruction = self._get_instruction(data)
+                waypoints = self._get_waypoints(data)
+                goal_position, success_radius = self._get_goal_info(data)
 
-        # Get units_in_meters for coordinate conversion
-        units_in_meters = data['scenarios'][0]['scene'].get('units_in_meters', 1.0)
+                # Get units_in_meters for coordinate conversion
+                units_in_meters = data['scenarios'][0]['scene'].get('units_in_meters', 1.0)
 
-        if len(waypoints) < self.data_args.num_future_waypoints + 2:
-            raise ValueError(
-                f"Sample has insufficient waypoints ({len(waypoints)}): {sample['json_path']}"
-            )
+                if len(waypoints) < self.data_args.num_future_waypoints + 2:
+                    if retry < max_retries - 1:
+                        continue
+                    raise ValueError(
+                        f"Sample has insufficient waypoints ({len(waypoints)}): {sample['json_path']}"
+                    )
 
-        # Sample a training point
-        current_idx = self._sample_training_point(
-            waypoints,
-            self.data_args.num_future_waypoints,
-            self.data_args.waypoint_stride
-        )
+                # Sample a training point
+                current_idx = self._sample_training_point(
+                    waypoints,
+                    self.data_args.num_future_waypoints,
+                    self.data_args.waypoint_stride
+                )
 
-        # Load video frames
-        video_frames = self._load_video_frames(
-            sample['rgb_video_path'],
-            waypoints,
-            current_idx,
-            self.data_args.max_frames
-        )
+                # Load video frames
+                video_frames = self._load_video_frames(
+                    sample['rgb_video_path'],
+                    waypoints,
+                    current_idx,
+                    self.data_args.max_frames
+                )
 
-        # Process video frames
-        processor = self.data_args.image_processor
-        if processor is None:
-            raise ValueError("`image_processor` is required for OmniNavBenchDataset")
-        video_tensor = processor.preprocess(video_frames, return_tensors='pt')['pixel_values']
+                # Process video frames
+                processor = self.data_args.image_processor
+                if processor is None:
+                    raise ValueError("`image_processor` is required for OmniNavBenchDataset")
+                video_tensor = processor.preprocess(video_frames, return_tensors='pt')['pixel_values']
 
-        # Compute relative waypoints
-        relative_positions, relative_yaws, arrive_labels = compute_relative_waypoints(
-            waypoints,
-            current_idx,
-            self.data_args.num_future_waypoints,
-            units_in_meters=units_in_meters,
-            stride=self.data_args.waypoint_stride
-        )
+                # Compute relative waypoints
+                relative_positions, relative_yaws, arrive_labels = compute_relative_waypoints(
+                    waypoints,
+                    current_idx,
+                    self.data_args.num_future_waypoints,
+                    units_in_meters=units_in_meters,
+                    stride=self.data_args.waypoint_stride,
+                    goal_position=goal_position,
+                    success_radius=success_radius
+                )
 
-        # Build conversation for tokenization
-        conversation = [
-            {
-                "from": "human",
-                "value": f"{DEFAULT_IMAGE_TOKEN}\n{NAVIGATION_IDENTIFIER}{instruction}"
-            },
-            {
-                "from": "gpt",
-                "value": "I will navigate to the target."  # Placeholder, actual output is waypoints
-            }
-        ]
+                # Build conversation for tokenization
+                conversation = [
+                    {
+                        "from": "human",
+                        "value": f"{DEFAULT_IMAGE_TOKEN}\n{NAVIGATION_IDENTIFIER}{instruction}"
+                    },
+                    {
+                        "from": "gpt",
+                        "value": "I will navigate to the target."  # Placeholder, actual output is waypoints
+                    }
+                ]
 
-        # Tokenize
-        data_dict = self._preprocess_conversation(
-            [conversation],
-            has_image=True,
-            video_or_not=True
-        )
+                # Tokenize
+                data_dict = self._preprocess_conversation(
+                    [conversation],
+                    has_image=True,
+                    video_or_not=True
+                )
 
-        # Build output dict
-        output = {
-            'input_ids': data_dict['input_ids'][0],
-            'labels': data_dict['labels'][0],
-            'image': video_tensor,
-            # Waypoint prediction targets
-            'waypoint_positions': torch.from_numpy(relative_positions),  # [N, 2]
-            'waypoint_yaws': torch.from_numpy(relative_yaws),  # [N, 2] (sin, cos)
-            'waypoint_arrive': torch.from_numpy(arrive_labels),  # [N]
-        }
+                # Build output dict
+                output = {
+                    'input_ids': data_dict['input_ids'][0],
+                    'labels': data_dict['labels'][0],
+                    'image': video_tensor,
+                    # Waypoint prediction targets
+                    'waypoint_positions': torch.from_numpy(relative_positions),  # [N, 2]
+                    'waypoint_yaws': torch.from_numpy(relative_yaws),  # [N, 2] (sin, cos)
+                    'waypoint_arrive': torch.from_numpy(arrive_labels),  # [N]
+                    # Prompt for navigation (required by model to identify navigation task)
+                    'prompt': [f"{NAVIGATION_IDENTIFIER}{instruction}"],
+                }
 
-        return output
+                return output
+
+            except Exception as e:
+                if retry < max_retries - 1:
+                    print(f"Warning: Failed to load sample {actual_idx} ({sample.get('rgb_video_path', 'unknown')}): {str(e)}")
+                    continue
+                else:
+                    raise RuntimeError(f"Failed to load sample after {max_retries} retries. Last error: {str(e)}")
     
     def _preprocess_conversation(
         self,
@@ -552,7 +608,11 @@ class OmniNavDataCollator:
             batch['waypoint_arrive'] = torch.stack(
                 [instance['waypoint_arrive'] for instance in instances]
             )
-        
+
+        # Handle prompts (required by model to identify navigation task)
+        if 'prompt' in instances[0]:
+            batch['prompts'] = [instance['prompt'] for instance in instances]
+
         return batch
 
 
