@@ -46,7 +46,6 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if is_vid_model:
         # Load LLaMA-VID model
         if model_base is not None:
-            # this may be mm projector only
             print('Loading LLaVA from base model...')
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             if is_waypoint_model:
@@ -64,9 +63,31 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     **kwargs,
                 )
 
-            mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
-            model.load_state_dict(mm_projector_weights, strict=False)
+            # 加载 non_lora_trainables（mm_projector + waypoint_head 等）
+            non_lora_path = os.path.join(model_path, 'non_lora_trainables.bin')
+            mm_proj_path = os.path.join(model_path, 'mm_projector.bin')
+            if os.path.exists(non_lora_path):
+                print(f"Loading non-LoRA trainables from {non_lora_path}")
+                non_lora_state = torch.load(non_lora_path, map_location='cpu')
+                cleaned = {}
+                for k, v in non_lora_state.items():
+                    clean_k = k.replace('base_model.model.', '')
+                    cleaned[clean_k] = v.to(torch.float16)
+                model.load_state_dict(cleaned, strict=False)
+            elif os.path.exists(mm_proj_path):
+                mm_projector_weights = torch.load(mm_proj_path, map_location='cpu')
+                mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+                model.load_state_dict(mm_projector_weights, strict=False)
+
+            # 加载 LoRA adapters 并合并
+            adapter_path = os.path.join(model_path, 'adapter_model.bin')
+            if os.path.exists(adapter_path):
+                from peft import PeftModel
+                print(f"Loading LoRA adapters from {model_path}")
+                model = PeftModel.from_pretrained(model, model_path)
+                print("Merging LoRA weights...")
+                model = model.merge_and_unload()
+                model.to(torch.float16)
         else:
             tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
             if is_waypoint_model:

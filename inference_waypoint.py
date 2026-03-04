@@ -28,54 +28,91 @@ torch.manual_seed(seed)
 np.random.seed(seed)
 
 
-def load_waypoint_model(model_path: str, device: str = "cuda"):
+def load_waypoint_model(model_path: str, model_base: str = None, device: str = "cuda"):
     """
-    Load the waypoint prediction model.
-    
+    加载 waypoint 预测模型。支持 LoRA checkpoint 和完整模型两种格式。
+
     Args:
-        model_path: Path to the model checkpoint
-        device: Device to load the model on
-    
+        model_path: LoRA checkpoint 目录或完整模型目录
+        model_base: 基础模型路径（LoRA checkpoint 时必须提供）
+        device: 加载设备
+
     Returns:
         tokenizer, model, image_processor, context_len
     """
     from transformers import AutoTokenizer, AutoConfig
     from uninavid.model.waypoint_head import LlavaWaypointForCausalLM, WaypointConfig
-    
-    # Load config
+
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    
-    # Check if this is a waypoint model or need to convert
+
     if not hasattr(config, 'num_waypoints'):
-        # Convert regular config to waypoint config
         config = WaypointConfig.from_pretrained(model_path)
         config.num_waypoints = 5
         config.waypoint_loss_weight = 1.0
         config.angle_loss_weight = 0.5
         config.arrive_loss_weight = 0.5
-        config.use_lm_loss = False  # Don't need LM loss for inference
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-    
-    # Load model
-    model = LlavaWaypointForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
+    config.use_lm_loss = False  # 推理时不需要 LM loss
+
+    is_lora = os.path.exists(os.path.join(model_path, 'adapter_model.bin'))
+
+    if is_lora:
+        if model_base is None:
+            raise ValueError(
+                f"'{model_path}' 是 LoRA checkpoint，必须通过 --model_base 指定基础模型路径"
+            )
+
+        from peft import PeftModel
+
+        print(f"从基础模型加载: {model_base}")
+        tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+        model = LlavaWaypointForCausalLM.from_pretrained(
+            model_base,
+            low_cpu_mem_usage=True,
+            config=config,
+            torch_dtype=torch.float16,
+        )
+
+        # 加载 non_lora_trainables（mm_projector + waypoint_head 的训练后权重）
+        non_lora_path = os.path.join(model_path, 'non_lora_trainables.bin')
+        if os.path.exists(non_lora_path):
+            print(f"加载 non-LoRA 参数: {non_lora_path}")
+            non_lora_state = torch.load(non_lora_path, map_location='cpu')
+            # 去掉 PEFT 包装添加的 base_model.model. 前缀
+            cleaned = {}
+            for k, v in non_lora_state.items():
+                clean_k = k.replace('base_model.model.', '')
+                cleaned[clean_k] = v.to(torch.float16)
+            model.load_state_dict(cleaned, strict=False)
+            print(f"已加载 {len(cleaned)} 个 non-LoRA 参数")
+
+        # 加载 LoRA adapters 并合并到基础模型
+        print(f"加载 LoRA adapters: {model_path}")
+        model = PeftModel.from_pretrained(model, model_path)
+        print("合并 LoRA 权重...")
+        model = model.merge_and_unload()
+        model.to(torch.float16)
+
+    else:
+        # 完整模型，直接加载
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = LlavaWaypointForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+
     model.eval()
-    
-    # Load image processor from the model's vision tower to guarantee preprocess parity
+    model.to(device)
+
     vision_tower = model.get_vision_tower()
     if not vision_tower.is_loaded:
         vision_tower.load_model()
     vision_tower.to(device=device, dtype=torch.float16)
     image_processor = vision_tower.image_processor
-    
-    context_len = config.max_position_embeddings
-    
+
+    context_len = getattr(config, 'max_position_embeddings', 2048)
+
     return tokenizer, model, image_processor, context_len
 
 
@@ -85,23 +122,24 @@ class WaypointAgent:
     Outputs continuous waypoints instead of discrete actions.
     """
     
-    def __init__(self, model_path: str, num_waypoints: int = 5):
+    def __init__(self, model_path: str, model_base: str = None, num_waypoints: int = 5):
         """
         Initialize the waypoint agent.
-        
+
         Args:
             model_path: Path to the model checkpoint
+            model_base: Path to the base model (required for LoRA checkpoints)
             num_waypoints: Number of waypoints to predict
         """
         print("Initialize WaypointAgent")
-        
+
         self.conv_mode = "vicuna_v1"
         self.num_waypoints = num_waypoints
         self.model_path = model_path
-        
+
         # Load model
         self.tokenizer, self.model, self.image_processor, self.context_len = \
-            self._load_model(model_path)
+            self._load_model(model_path, model_base)
         
         assert self.image_processor is not None
         
@@ -119,9 +157,9 @@ class WaypointAgent:
         self.count_id = 0
         self.reset()
     
-    def _load_model(self, model_path: str):
+    def _load_model(self, model_path: str, model_base: str = None):
         """Load the model with waypoint head support."""
-        return load_waypoint_model(model_path)
+        return load_waypoint_model(model_path, model_base=model_base)
     
     def process_images(self, rgb_list: List[np.ndarray]) -> List[torch.Tensor]:
         """Process a list of RGB images for model input."""
@@ -421,18 +459,20 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Waypoint-based navigation inference')
     parser.add_argument('test_case', help='Test case path (images dir)')
     parser.add_argument('output_dir', help='Output directory to save results')
-    parser.add_argument('--model_path', default='model_zoo/uninavid-waypoint-7b',
+    parser.add_argument('--model_path', default='model_zoo/uninavid-7b-omninav-waypoint',
                         help='Path to model checkpoint')
+    parser.add_argument('--model_base', default=None,
+                        help='Path to base model (required for LoRA checkpoints)')
     parser.add_argument('--num_waypoints', type=int, default=5,
                         help='Number of waypoints to predict')
-    
+
     args = parser.parse_args()
-    
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     # Initialize agent
-    agent = WaypointAgent(args.model_path, num_waypoints=args.num_waypoints)
+    agent = WaypointAgent(args.model_path, model_base=args.model_base, num_waypoints=args.num_waypoints)
     agent.reset()
     
     # Load test data
