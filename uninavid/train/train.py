@@ -1314,6 +1314,14 @@ def train():
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
+        # get_peft_model() 会冻结所有非 LoRA 参数，需要手动恢复 waypoint_head 的梯度
+        if getattr(model_args, 'use_waypoint_head', False):
+            waypoint_head = model.base_model.model.waypoint_head
+            for p in waypoint_head.parameters():
+                p.requires_grad = True
+            rank0_print(f"Restored waypoint_head requires_grad: "
+                        f"{sum(p.numel() for p in waypoint_head.parameters())} params unfrozen")
+
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,

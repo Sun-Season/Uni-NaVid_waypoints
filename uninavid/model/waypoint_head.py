@@ -247,9 +247,7 @@ class LlavaWaypointForCausalLM(LlavaLlamaAttForCausalLM):
             self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images, prompts=prompts
             )
-        
-        torch.cuda.empty_cache()
-        
+
         # Forward through LLM
         outputs = self.model(
             input_ids=input_ids,
@@ -261,9 +259,14 @@ class LlavaWaypointForCausalLM(LlavaLlamaAttForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
-        
+
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+
+        # 仅在需要语言建模损失时才计算 lm_head，避免无用的大矩阵乘法
+        if self.use_lm_loss:
+            logits = self.lm_head(hidden_states)
+        else:
+            logits = None
         
         # Waypoint prediction
         pred_positions, pred_angles, pred_arrive = self.waypoint_head(

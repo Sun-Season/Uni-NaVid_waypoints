@@ -44,6 +44,7 @@ deepspeed uninavid/train/train_mem.py \
     --video_fps 30 \
     --compress_type "grid:2" \
     --use_waypoint_head True \
+    --use_lm_loss_for_waypoint True \
     --num_waypoints $NUM_WAYPOINTS \
     --waypoint_loss_weight $WAYPOINT_LOSS_WEIGHT \
     --angle_loss_weight $ANGLE_LOSS_WEIGHT \
