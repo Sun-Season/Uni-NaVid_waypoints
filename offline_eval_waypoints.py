@@ -129,7 +129,7 @@ class UniNaVid_Waypoint_Agent():
             waypoint_predictions = self.model.predict_waypoints(
                 input_ids=input_ids,
                 images=imgs,
-                prompts=[f"{NAVIGATION_IDENTIFIER}{instruction}"]
+                prompts=[[f"{NAVIGATION_IDENTIFIER}{instruction}"]]
             )
 
         return waypoint_predictions

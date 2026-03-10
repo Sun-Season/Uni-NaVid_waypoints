@@ -59,8 +59,11 @@ class WaypointHead(nn.Module):
     """
     MLP-based waypoint prediction head.
     Uses cross-attention to extract action features from VLM hidden states.
+
+    Predicts (r, sin, cos) jointly and computes (x, y) = (r * cos(yaw), r * sin(yaw))
+    to ensure position and angle are consistent.
     """
-    
+
     def __init__(
         self,
         hidden_size: int,
@@ -71,11 +74,11 @@ class WaypointHead(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_waypoints = num_waypoints
-        
+
         # Learnable query for action extraction
         self.query_action = nn.Parameter(torch.empty(1, 1, hidden_size))
         nn.init.normal_(self.query_action, std=0.02)
-        
+
         # Cross-attention to extract action features from VLM hidden states
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
@@ -83,26 +86,19 @@ class WaypointHead(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        
+
         # Layer norm after attention
         self.layer_norm = nn.LayerNorm(hidden_size)
-        
-        # MLP for waypoint position prediction (x, y)
-        self.position_predictor = nn.Sequential(
+
+        # Unified MLP for waypoint prediction: (r, sin, cos) per waypoint
+        # Output: [N * 3] -> r, sin, cos for each waypoint
+        self.waypoint_predictor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_waypoints * 2)  # [N, 2] for (x, y)
+            nn.Linear(hidden_size, num_waypoints * 3)  # [N, 3] for (r, sin, cos)
         )
-        
-        # MLP for waypoint angle prediction (sin, cos)
-        self.angle_predictor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_waypoints * 2)  # [N, 2] for (sin, cos)
-        )
-        
+
         # MLP for arrive prediction
         self.arrive_predictor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
@@ -110,7 +106,7 @@ class WaypointHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, num_waypoints)  # [N] for arrive probability
         )
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -118,26 +114,28 @@ class WaypointHead(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for waypoint prediction.
-        
+
+        Predicts (r, sin, cos) jointly and computes (x, y) = (r * cos(yaw), r * sin(yaw)).
+
         Args:
             hidden_states: [batch_size, seq_len, hidden_size] from VLM
             attention_mask: [batch_size, seq_len] attention mask
-        
+
         Returns:
             positions: [batch_size, num_waypoints, 2] predicted (x, y)
             angles: [batch_size, num_waypoints, 2] predicted (sin, cos)
             arrive: [batch_size, num_waypoints] predicted arrive probability
         """
         batch_size = hidden_states.shape[0]
-        
+
         # Expand query for batch
         query = self.query_action.expand(batch_size, -1, -1)
-        
+
         # Create key padding mask for attention (True = ignore)
         key_padding_mask = None
         if attention_mask is not None:
             key_padding_mask = ~attention_mask.bool()
-        
+
         # Cross-attention: query attends to hidden states
         action_features, _ = self.cross_attention(
             query=query,
@@ -145,26 +143,40 @@ class WaypointHead(nn.Module):
             value=hidden_states,
             key_padding_mask=key_padding_mask
         )
-        
+
         # Layer norm
         action_features = self.layer_norm(action_features)
-        
+
         # Squeeze the sequence dimension (we only have 1 query)
         action_features = action_features.squeeze(1)  # [batch_size, hidden_size]
-        
-        # Predict waypoints
-        positions = self.position_predictor(action_features)
-        positions = positions.view(batch_size, self.num_waypoints, 2)
-        
-        # Predict angles (use tanh to bound sin/cos to [-1, 1])
-        angles = self.angle_predictor(action_features)
-        angles = torch.tanh(angles)
-        angles = angles.view(batch_size, self.num_waypoints, 2)
-        
+
+        # Predict (r, sin, cos) jointly
+        waypoint_raw = self.waypoint_predictor(action_features)  # [batch_size, N * 3]
+        waypoint_raw = waypoint_raw.view(batch_size, self.num_waypoints, 3)  # [batch_size, N, 3]
+
+        # Extract r, sin, cos
+        r_raw = waypoint_raw[..., 0]  # [batch_size, N]
+        sin_raw = waypoint_raw[..., 1]  # [batch_size, N]
+        cos_raw = waypoint_raw[..., 2]  # [batch_size, N]
+
+        # Apply softplus to r to ensure positive
+        r = F.softplus(r_raw)  # [batch_size, N]
+
+        # Normalize (sin, cos) to unit circle
+        sin_cos = torch.stack([sin_raw, cos_raw], dim=-1)  # [batch_size, N, 2]
+        angles_norm = F.normalize(sin_cos, dim=-1)
+        sin_yaw = angles_norm[..., 0]  # [batch_size, N]
+        cos_yaw = angles_norm[..., 1]  # [batch_size, N]
+
+        # Compute (x, y) from (r, yaw): x = r * cos(yaw), y = r * sin(yaw)
+        x = r * cos_yaw  # [batch_size, N]
+        y = r * sin_yaw  # [batch_size, N]
+        positions = torch.stack([x, y], dim=-1)  # [batch_size, N, 2]
+
         # Predict arrive probability
         arrive = self.arrive_predictor(action_features)  # [batch_size, num_waypoints]
-        
-        return positions, angles, arrive
+
+        return positions, angles_norm, arrive
 
 
 class LlavaWaypointForCausalLM(LlavaLlamaAttForCausalLM):
