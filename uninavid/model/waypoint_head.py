@@ -60,8 +60,8 @@ class WaypointHead(nn.Module):
     MLP-based waypoint prediction head.
     Uses cross-attention to extract action features from VLM hidden states.
 
-    Predicts (r, sin, cos) jointly and computes (x, y) = (r * cos(yaw), r * sin(yaw))
-    to ensure position and angle are consistent.
+    Predicts (x, y, sin, cos) jointly from a single MLP to maintain correlation
+    between position and orientation.
     """
 
     def __init__(
@@ -90,13 +90,13 @@ class WaypointHead(nn.Module):
         # Layer norm after attention
         self.layer_norm = nn.LayerNorm(hidden_size)
 
-        # Unified MLP for waypoint prediction: (r, sin, cos) per waypoint
-        # Output: [N * 3] -> r, sin, cos for each waypoint
+        # Unified MLP for waypoint prediction: (x, y, sin, cos) per waypoint
+        # Output: [N * 4] -> x, y, sin, cos for each waypoint
         self.waypoint_predictor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_waypoints * 3)  # [N, 3] for (r, sin, cos)
+            nn.Linear(hidden_size, num_waypoints * 4)  # [N, 4] for (x, y, sin, cos)
         )
 
         # MLP for arrive prediction
@@ -115,7 +115,7 @@ class WaypointHead(nn.Module):
         """
         Forward pass for waypoint prediction.
 
-        Predicts (r, sin, cos) jointly and computes (x, y) = (r * cos(yaw), r * sin(yaw)).
+        Predicts (x, y, sin, cos) jointly from a single MLP.
 
         Args:
             hidden_states: [batch_size, seq_len, hidden_size] from VLM
@@ -150,28 +150,22 @@ class WaypointHead(nn.Module):
         # Squeeze the sequence dimension (we only have 1 query)
         action_features = action_features.squeeze(1)  # [batch_size, hidden_size]
 
-        # Predict (r, sin, cos) jointly
-        waypoint_raw = self.waypoint_predictor(action_features)  # [batch_size, N * 3]
-        waypoint_raw = waypoint_raw.view(batch_size, self.num_waypoints, 3)  # [batch_size, N, 3]
+        # Predict (x, y, sin, cos) jointly
+        waypoint_raw = self.waypoint_predictor(action_features)  # [batch_size, N * 4]
+        waypoint_raw = waypoint_raw.view(batch_size, self.num_waypoints, 4)  # [batch_size, N, 4]
 
-        # Extract r, sin, cos
-        r_raw = waypoint_raw[..., 0]  # [batch_size, N]
-        sin_raw = waypoint_raw[..., 1]  # [batch_size, N]
-        cos_raw = waypoint_raw[..., 2]  # [batch_size, N]
+        # Extract x, y, sin, cos
+        x = waypoint_raw[..., 0]  # [batch_size, N]
+        y = waypoint_raw[..., 1]  # [batch_size, N]
+        sin_raw = waypoint_raw[..., 2]  # [batch_size, N]
+        cos_raw = waypoint_raw[..., 3]  # [batch_size, N]
 
-        # Apply softplus to r to ensure positive
-        r = F.softplus(r_raw)  # [batch_size, N]
+        # Stack positions
+        positions = torch.stack([x, y], dim=-1)  # [batch_size, N, 2]
 
         # Normalize (sin, cos) to unit circle
         sin_cos = torch.stack([sin_raw, cos_raw], dim=-1)  # [batch_size, N, 2]
         angles_norm = F.normalize(sin_cos, dim=-1)
-        sin_yaw = angles_norm[..., 0]  # [batch_size, N]
-        cos_yaw = angles_norm[..., 1]  # [batch_size, N]
-
-        # Compute (x, y) from (r, yaw): x = r * cos(yaw), y = r * sin(yaw)
-        x = r * cos_yaw  # [batch_size, N]
-        y = r * sin_yaw  # [batch_size, N]
-        positions = torch.stack([x, y], dim=-1)  # [batch_size, N, 2]
 
         # Predict arrive probability
         arrive = self.arrive_predictor(action_features)  # [batch_size, num_waypoints]
