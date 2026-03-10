@@ -89,7 +89,13 @@ def compute_relative_waypoints(
     success_radius: float = 0.5
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    计算相对于当前位置的未来航点
+    计算相对于当前位置的未来航点（增量形式，遵循 OmniNav 的方法）
+
+    返回的 waypoint 格式：
+    - waypoint[0]: 相对于当前机器人位置的绝对坐标
+    - waypoint[i] (i>0): 相对于 waypoint[i-1] 的增量
+
+    模型预测增量，然后通过 cumsum 恢复绝对位置。
 
     Args:
         waypoints: 航点字典列表，包含 'xyz' 和 'yaw_deg' 字段
@@ -101,7 +107,9 @@ def compute_relative_waypoints(
         success_radius: 判定到达的距离阈值（单位：米）
 
     Returns:
-        relative_positions: [num_future, 2] 数组，相对位置 (dx, dy)，单位米
+        delta_positions: [num_future, 2] 数组，增量位置
+            - delta_positions[0]: 相对于机器人的绝对位置
+            - delta_positions[i] (i>0): 相对于前一个 waypoint 的增量
         relative_yaws: [num_future, 2] 数组，相对朝向的 (sin, cos) 表示
         arrive_labels: [num_future] 数组，到达标签（1 表示在目标的 success_radius 范围内）
     """
@@ -123,7 +131,8 @@ def compute_relative_waypoints(
         [sin_yaw, cos_yaw]
     ])
 
-    relative_positions = []
+    # 首先计算所有 waypoint 的绝对位置（相对于机器人）
+    absolute_positions = []
     relative_yaws = []
     arrive_labels = []
 
@@ -147,7 +156,7 @@ def compute_relative_waypoints(
             # 归一化到 [-pi, pi]
             relative_yaw = np.arctan2(np.sin(relative_yaw), np.cos(relative_yaw))
 
-            relative_positions.append(relative_pos)
+            absolute_positions.append(relative_pos)
             relative_yaws.append([np.sin(relative_yaw), np.cos(relative_yaw)])
 
             # 到达标签：基于到目标的距离
@@ -160,14 +169,25 @@ def compute_relative_waypoints(
             arrive_labels.append(1.0 if is_arrived else 0.0)
         else:
             # 如果到达轨迹末尾，用零填充
-            relative_positions.append([0.0, 0.0])
+            absolute_positions.append([0.0, 0.0])
             relative_yaws.append([0.0, 1.0])  # sin=0, cos=1 表示无旋转
             arrive_labels.append(1.0)  # 标记为已到达（超过轨迹末尾）
 
+    # 转换为 numpy 数组
+    absolute_positions = np.array(absolute_positions, dtype=np.float32)  # [N, 2]
+
+    # 转换为增量形式（遵循 OmniNav 的方法）
+    # delta[0] = absolute[0]  (相对于机器人的绝对位置)
+    # delta[i] = absolute[i] - absolute[i-1]  (相对于前一个 waypoint 的增量)
+    delta_positions = np.zeros_like(absolute_positions)
+    delta_positions[0] = absolute_positions[0]  # 第一个点：绝对位置
+    if num_future > 1:
+        delta_positions[1:] = absolute_positions[1:] - absolute_positions[:-1]  # 后续点：增量
+
     return (
-        np.array(relative_positions, dtype=np.float32),
-        np.array(relative_yaws, dtype=np.float32),
-        np.array(arrive_labels, dtype=np.float32)
+        delta_positions,  # [num_future, 2] 增量形式
+        np.array(relative_yaws, dtype=np.float32),  # [num_future, 2]
+        np.array(arrive_labels, dtype=np.float32)  # [num_future]
     )
 
 

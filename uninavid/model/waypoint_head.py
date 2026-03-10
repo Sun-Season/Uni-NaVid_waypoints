@@ -60,8 +60,10 @@ class WaypointHead(nn.Module):
     MLP-based waypoint prediction head.
     Uses cross-attention to extract action features from VLM hidden states.
 
-    Predicts (x, y, sin, cos) jointly from a single MLP to maintain correlation
-    between position and orientation.
+    Predicts delta waypoints (incremental positions) following OmniNav's approach:
+    - First waypoint: absolute position relative to robot
+    - Subsequent waypoints: incremental deltas relative to previous waypoint
+    - Uses cumsum to recover absolute positions during inference
     """
 
     def __init__(
@@ -90,13 +92,22 @@ class WaypointHead(nn.Module):
         # Layer norm after attention
         self.layer_norm = nn.LayerNorm(hidden_size)
 
-        # Unified MLP for waypoint prediction: (x, y, sin, cos) per waypoint
-        # Output: [N * 4] -> x, y, sin, cos for each waypoint
+        # MLP for waypoint delta prediction: (dx, dy) per waypoint
+        # Predicts incremental positions that will be accumulated via cumsum
         self.waypoint_predictor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_waypoints * 4)  # [N, 4] for (x, y, sin, cos)
+            nn.Linear(hidden_size, num_waypoints * 2)  # [N, 2] for (dx, dy)
+        )
+
+        # MLP for angle prediction: (sin, cos) per waypoint
+        # Angles are predicted independently (not accumulated)
+        self.angle_predictor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_waypoints * 2)  # [N, 2] for (sin, cos)
         )
 
         # MLP for arrive prediction
@@ -115,14 +126,19 @@ class WaypointHead(nn.Module):
         """
         Forward pass for waypoint prediction.
 
-        Predicts (x, y, sin, cos) jointly from a single MLP.
+        Predicts delta waypoints and uses cumsum to recover absolute positions.
+        Following OmniNav's approach:
+        - Model predicts: [delta_0, delta_1, delta_2, delta_3, delta_4]
+        - delta_0 is absolute position relative to robot
+        - delta_i (i>0) is relative to waypoint_{i-1}
+        - cumsum recovers absolute positions
 
         Args:
             hidden_states: [batch_size, seq_len, hidden_size] from VLM
             attention_mask: [batch_size, seq_len] attention mask
 
         Returns:
-            positions: [batch_size, num_waypoints, 2] predicted (x, y)
+            positions: [batch_size, num_waypoints, 2] predicted (x, y) in absolute coords
             angles: [batch_size, num_waypoints, 2] predicted (sin, cos)
             arrive: [batch_size, num_waypoints] predicted arrive probability
         """
@@ -150,22 +166,20 @@ class WaypointHead(nn.Module):
         # Squeeze the sequence dimension (we only have 1 query)
         action_features = action_features.squeeze(1)  # [batch_size, hidden_size]
 
-        # Predict (x, y, sin, cos) jointly
-        waypoint_raw = self.waypoint_predictor(action_features)  # [batch_size, N * 4]
-        waypoint_raw = waypoint_raw.view(batch_size, self.num_waypoints, 4)  # [batch_size, N, 4]
+        # Predict delta waypoints (dx, dy)
+        delta_positions = self.waypoint_predictor(action_features)  # [batch_size, N * 2]
+        delta_positions = delta_positions.view(batch_size, self.num_waypoints, 2)  # [batch_size, N, 2]
 
-        # Extract x, y, sin, cos
-        x = waypoint_raw[..., 0]  # [batch_size, N]
-        y = waypoint_raw[..., 1]  # [batch_size, N]
-        sin_raw = waypoint_raw[..., 2]  # [batch_size, N]
-        cos_raw = waypoint_raw[..., 3]  # [batch_size, N]
+        # Cumulative sum to get absolute positions
+        # delta_0 is absolute, delta_i (i>0) is relative to previous waypoint
+        positions = torch.cumsum(delta_positions, dim=1)  # [batch_size, N, 2]
 
-        # Stack positions
-        positions = torch.stack([x, y], dim=-1)  # [batch_size, N, 2]
+        # Predict angles (sin, cos) - independent prediction, not accumulated
+        angle_raw = self.angle_predictor(action_features)  # [batch_size, N * 2]
+        angle_raw = angle_raw.view(batch_size, self.num_waypoints, 2)  # [batch_size, N, 2]
 
         # Normalize (sin, cos) to unit circle
-        sin_cos = torch.stack([sin_raw, cos_raw], dim=-1)  # [batch_size, N, 2]
-        angles_norm = F.normalize(sin_cos, dim=-1)
+        angles_norm = F.normalize(angle_raw, dim=-1)  # [batch_size, N, 2]
 
         # Predict arrive probability
         arrive = self.arrive_predictor(action_features)  # [batch_size, num_waypoints]
@@ -301,7 +315,11 @@ class LlavaWaypointForCausalLM(LlavaLlamaAttForCausalLM):
         # Waypoint losses
         if waypoint_positions is not None:
             waypoint_positions = waypoint_positions.to(pred_positions.device)
-            waypoint_loss = F.l1_loss(pred_positions, waypoint_positions)
+            # GT waypoint_positions from dataloader are in delta form
+            # Convert to absolute positions using cumsum (same as model prediction)
+            gt_positions_absolute = torch.cumsum(waypoint_positions, dim=1)
+            # Compute loss on absolute positions
+            waypoint_loss = F.l1_loss(pred_positions, gt_positions_absolute)
         
         if waypoint_yaws is not None:
             waypoint_yaws = waypoint_yaws.to(pred_angles.device)
