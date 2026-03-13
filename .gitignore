@@ -35,3 +35,7 @@ ckpts*
 # DevContainer
 !.devcontainer/*
 
+.claude/
+.vscode/
+OmniNavBench
+passed_samples
