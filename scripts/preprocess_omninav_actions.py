@@ -11,11 +11,16 @@
             actions.json
 
 对齐方式: video_frame = int(time_s * 30)
-参数: FORWARD_DISTANCE=0.25m, TURN_ANGLE=30°
+
+动作生成逻辑:
+- Wait: 相邻 waypoint 时间间隔 > 1秒
+- Turn: 累积 yaw 变化达到 ±20° 生成 left/right
+- Forward: 累积位移达到 0.25m 生成 forward
+- Stop: 轨迹结束
 
 特性:
-- 智能采样：直线段稀疏采样，转弯段密集采样
-- STOP action：每个 episode 最后一个 sample 的 actions 为 ['stop', 'stop', 'stop', 'stop']
+- 滑动窗口采样：先生成完整动作序列，再用滑动窗口切分成样本
+- 窗口大小=4，步长=2，每个样本包含4个真实动作
 """
 
 import os
@@ -28,92 +33,26 @@ from pathlib import Path
 
 # Waypoint to action conversion parameters
 FORWARD_DISTANCE = 0.25  # meters per forward action
-TURN_ANGLE = math.radians(30)  # 30 degrees per turn action
-MIN_DISPLACEMENT = 0.05  # minimum displacement threshold
-NUM_ACTIONS = 4  # fixed number of actions to predict
+TURN_ANGLE = 20.0  # degrees per turn action
+WAIT_TIME_THRESHOLD = 2.0  # seconds, time gap > this triggers wait
+WAIT_TIME_PER_ACTION = 2.0  # seconds per wait action
+STATIONARY_THRESHOLD = 0.03  # meters, if displacement < this, consider as stationary
 VIDEO_FPS = 30  # video frame rate
 
-# Smart sampling parameters
-TURN_DETECTION_THRESHOLD = 0.1  # radians (~6 degrees)
-STRAIGHT_SAMPLE_INTERVAL = 5  # sample every 5 waypoints in straight segments
-TURN_SAMPLE_INTERVAL = 1  # sample every waypoint in turning segments
-USE_SMART_SAMPLING = True  # enable/disable smart sampling
+# Sliding window parameters
+WINDOW_SIZE = 4  # number of actions per sample
+WINDOW_STRIDE = 2  # step size for sliding window
+
+MAX_SINGLE_STEP_DISTANCE = 2.0  # max distance between adjacent waypoints (meters)
 
 
-def normalize_angle(angle: float) -> float:
-    """Normalize angle to [-pi, pi]."""
-    while angle > math.pi:
-        angle -= 2 * math.pi
-    while angle < -math.pi:
-        angle += 2 * math.pi
+def normalize_angle_deg(angle: float) -> float:
+    """Normalize angle to [-180, 180] degrees."""
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
     return angle
-
-
-def waypoint_to_actions(current_pose: dict, future_pose: dict) -> Tuple[List[str], int]:
-    """Convert waypoint to discrete action sequence.
-
-    Args:
-        current_pose: dict with 'x', 'y', 'yaw' (yaw in radians)
-        future_pose: dict with 'x', 'y', 'yaw' (yaw in radians)
-
-    Returns:
-        (actions, raw_count) tuple
-    """
-    dx = future_pose['x'] - current_pose['x']
-    dy = future_pose['y'] - current_pose['y']
-    r = math.sqrt(dx*dx + dy*dy)
-    yaw_diff = normalize_angle(future_pose['yaw'] - current_pose['yaw'])
-
-    actions = []
-
-    if r >= MIN_DISPLACEMENT:
-        global_theta = math.atan2(dy, dx)
-        relative_theta = normalize_angle(global_theta - current_pose['yaw'])
-
-        # First turn towards target
-        while abs(relative_theta) > TURN_ANGLE / 2:
-            if relative_theta > 0:
-                actions.append('left')
-                relative_theta -= TURN_ANGLE
-            else:
-                actions.append('right')
-                relative_theta += TURN_ANGLE
-
-        # Then move forward
-        remaining_dist = r
-        while remaining_dist > FORWARD_DISTANCE / 2:
-            actions.append('forward')
-            remaining_dist -= FORWARD_DISTANCE
-    else:
-        # In-place rotation
-        while abs(yaw_diff) > TURN_ANGLE / 2:
-            if yaw_diff > 0:
-                actions.append('left')
-                yaw_diff -= TURN_ANGLE
-            else:
-                actions.append('right')
-                yaw_diff += TURN_ANGLE
-
-    # Handle action count
-    raw_count = len(actions)
-    if len(actions) == 0:
-        actions = ['wait'] * NUM_ACTIONS
-    else:
-        if len(actions) > NUM_ACTIONS:
-            actions = actions[:NUM_ACTIONS]
-        while len(actions) < NUM_ACTIONS:
-            actions.append(actions[-1])
-
-    return actions, raw_count
-
-
-def omninav_wp_to_pose(wp: dict, units_in_meters: float = 1.0) -> dict:
-    """Convert OmniNavBench waypoint to pose dict."""
-    return {
-        'x': wp['xyz'][0] * units_in_meters,
-        'y': wp['xyz'][1] * units_in_meters,
-        'yaw': math.radians(wp['yaw_deg'])
-    }
 
 
 def get_video_frame(time_s: float) -> int:
@@ -121,64 +60,212 @@ def get_video_frame(time_s: float) -> int:
     return int(time_s * VIDEO_FPS)
 
 
-MAX_SINGLE_STEP_DISTANCE = 2.0  # max distance between adjacent waypoints (meters)
+def generate_full_action_sequence(waypoints: List[dict], units_in_meters: float) -> List[dict]:
+    """Generate complete action sequence from all waypoints.
 
+    Logic:
+    1. Wait: 当robot静止（位移<0.01m）时累积时间，每累积2秒生成一个wait
+    2. Turn: 累积 yaw 变化达到 ±20° → 生成 left/right（先处理）
+    3. Forward: 累积位移达到 0.25m → 生成 forward（后处理）
+    4. Stop: 轨迹结束时生成
 
-def detect_trajectory_features(waypoints: List[dict], units_in_meters: float = 1.0) -> List[str]:
-    """Detect trajectory features: straight segments vs turning segments."""
-    if len(waypoints) < 3:
-        return ['start'] + ['straight'] * (len(waypoints) - 2) + ['end'] if len(waypoints) > 1 else ['start']
+    Returns:
+        List of action entries with action, wp_idx, time_s, video_frame
+    """
+    if len(waypoints) < 2:
+        return []
 
-    features = []
+    action_sequence = []
 
-    for i in range(len(waypoints)):
-        if i == 0:
-            features.append('start')
-        elif i == len(waypoints) - 1:
-            features.append('end')
-        else:
-            prev_yaw = math.radians(waypoints[i - 1]['yaw_deg'])
-            next_yaw = math.radians(waypoints[i + 1]['yaw_deg'])
-            angle_change = abs(normalize_angle(next_yaw - prev_yaw))
+    # Accumulators
+    accumulated_dist = 0.0
+    accumulated_yaw = 0.0  # in degrees
+    accumulated_wait_time = 0.0  # for stationary detection
+    wait_start_wp_idx = None  # track where wait started
 
-            if angle_change > TURN_DETECTION_THRESHOLD:
-                features.append('turning')
+    for i in range(1, len(waypoints)):
+        prev_wp = waypoints[i - 1]
+        curr_wp = waypoints[i]
+
+        time_gap = curr_wp['time_s'] - prev_wp['time_s']
+
+        # Calculate displacement
+        dx = (curr_wp['xyz'][0] - prev_wp['xyz'][0]) * units_in_meters
+        dy = (curr_wp['xyz'][1] - prev_wp['xyz'][1]) * units_in_meters
+        step_dist = math.sqrt(dx*dx + dy*dy)
+
+        # Check for anomalous jump (teleport)
+        if step_dist > MAX_SINGLE_STEP_DISTANCE:
+            accumulated_dist = 0.0
+            accumulated_yaw = 0.0
+            accumulated_wait_time = 0.0
+            wait_start_wp_idx = None
+            continue
+
+        # 1. Check for stationary (wait): displacement < threshold
+        if step_dist < STATIONARY_THRESHOLD:
+            # Robot is stationary, accumulate wait time
+            if wait_start_wp_idx is None:
+                wait_start_wp_idx = i - 1
+            accumulated_wait_time += time_gap
+
+            # Generate wait actions when accumulated time >= threshold
+            while accumulated_wait_time >= WAIT_TIME_PER_ACTION:
+                action_sequence.append({
+                    'action': 'wait',
+                    'wp_idx': wait_start_wp_idx,
+                    'future_wp_idx': i,
+                    'time_s': waypoints[wait_start_wp_idx]['time_s'],
+                    'video_frame': get_video_frame(waypoints[wait_start_wp_idx]['time_s']),
+                })
+                accumulated_wait_time -= WAIT_TIME_PER_ACTION
+            continue
+
+        # Robot is moving, reset wait accumulator
+        accumulated_wait_time = 0.0
+        wait_start_wp_idx = None
+
+        # 2. Accumulate yaw change (in degrees)
+        prev_yaw = prev_wp['yaw_deg']
+        curr_yaw = curr_wp['yaw_deg']
+        yaw_change = normalize_angle_deg(curr_yaw - prev_yaw)
+        accumulated_yaw += yaw_change
+
+        # Generate turn actions (process turn BEFORE forward)
+        while abs(accumulated_yaw) >= TURN_ANGLE:
+            if accumulated_yaw > 0:
+                action_sequence.append({
+                    'action': 'left',
+                    'wp_idx': i - 1,
+                    'future_wp_idx': i,
+                    'time_s': prev_wp['time_s'],
+                    'video_frame': get_video_frame(prev_wp['time_s']),
+                })
+                accumulated_yaw -= TURN_ANGLE
             else:
-                features.append('straight')
+                action_sequence.append({
+                    'action': 'right',
+                    'wp_idx': i - 1,
+                    'future_wp_idx': i,
+                    'time_s': prev_wp['time_s'],
+                    'video_frame': get_video_frame(prev_wp['time_s']),
+                })
+                accumulated_yaw += TURN_ANGLE
 
-    return features
+        # 3. Accumulate displacement
+        accumulated_dist += step_dist
+
+        # Generate forward actions (process forward AFTER turn)
+        while accumulated_dist >= FORWARD_DISTANCE:
+            action_sequence.append({
+                'action': 'forward',
+                'wp_idx': i - 1,
+                'future_wp_idx': i,
+                'time_s': prev_wp['time_s'],
+                'video_frame': get_video_frame(prev_wp['time_s']),
+            })
+            accumulated_dist -= FORWARD_DISTANCE
+
+    # 4. Add final 'stop' actions (4 stops to ensure final window is all stops)
+    last_wp = waypoints[-1]
+    for _ in range(WINDOW_SIZE):
+        action_sequence.append({
+            'action': 'stop',
+            'wp_idx': len(waypoints) - 1,
+            'future_wp_idx': len(waypoints) - 1,
+            'time_s': last_wp['time_s'],
+            'video_frame': get_video_frame(last_wp['time_s']),
+        })
+
+    return action_sequence
 
 
-def smart_sample_waypoints(waypoints: List[dict], features: List[str]) -> List[int]:
-    """Intelligent waypoint sampling: sparse for straight, dense for turning."""
-    if not USE_SMART_SAMPLING or len(waypoints) < 3:
-        return list(range(len(waypoints)))
+def sliding_window_samples(action_sequence: List[dict],
+                           window_size: int = WINDOW_SIZE,
+                           stride: int = WINDOW_STRIDE) -> List[dict]:
+    """Apply sliding window to action sequence to create samples.
 
-    sampled_indices = [0]  # Always include start
+    Args:
+        action_sequence: Full action sequence with metadata
+        window_size: Number of actions per sample (default 4)
+        stride: Step size for sliding window (default 2)
 
-    i = 1
-    while i < len(waypoints) - 1:
-        feature = features[i]
+    Returns:
+        List of samples, each with 'actions' and metadata
+    """
+    samples = []
 
-        if feature == 'turning':
-            interval = TURN_SAMPLE_INTERVAL
-        else:  # straight
-            interval = STRAIGHT_SAMPLE_INTERVAL
+    if len(action_sequence) < window_size:
+        # Not enough actions, pad with wait
+        actions = [a['action'] for a in action_sequence]
+        while len(actions) < window_size:
+            actions.append('wait')
 
-        if i % interval == 0 or feature == 'turning':
-            sampled_indices.append(i)
+        first_entry = action_sequence[0] if action_sequence else None
+        if first_entry:
+            samples.append({
+                'wp_idx': first_entry['wp_idx'],
+                'video_frame': first_entry['video_frame'],
+                'time_s': first_entry['time_s'],
+                'actions': actions,
+                'action_str': ' '.join(actions),
+            })
+        return samples
 
-        i += 1
+    # Sliding window
+    for i in range(0, len(action_sequence) - window_size + 1, stride):
+        window = action_sequence[i:i + window_size]
+        actions = [a['action'] for a in window]
 
-    # Always include end
-    if sampled_indices[-1] != len(waypoints) - 1:
-        sampled_indices.append(len(waypoints) - 1)
+        # Use first action's metadata for the sample
+        first_entry = window[0]
+        last_entry = window[-1]
 
-    return sampled_indices
+        samples.append({
+            'wp_idx': first_entry['wp_idx'],
+            'future_wp_idx': last_entry['future_wp_idx'],
+            'video_frame': first_entry['video_frame'],
+            'future_video_frame': last_entry['video_frame'],
+            'time_s': first_entry['time_s'],
+            'future_time_s': last_entry['time_s'],
+            'actions': actions,
+            'action_str': ' '.join(actions),
+        })
+
+    # Handle remaining actions (if any) - ensure we include the end
+    last_start = (len(action_sequence) - window_size) // stride * stride
+    if last_start + window_size < len(action_sequence):
+        # There are remaining actions not covered
+        remaining_start = len(action_sequence) - window_size
+        if remaining_start > last_start:
+            window = action_sequence[remaining_start:]
+            actions = [a['action'] for a in window]
+            first_entry = window[0]
+            last_entry = window[-1]
+
+            samples.append({
+                'wp_idx': first_entry['wp_idx'],
+                'future_wp_idx': last_entry['future_wp_idx'],
+                'video_frame': first_entry['video_frame'],
+                'future_video_frame': last_entry['video_frame'],
+                'time_s': first_entry['time_s'],
+                'future_time_s': last_entry['time_s'],
+                'actions': actions,
+                'action_str': ' '.join(actions),
+            })
+
+    return samples
 
 
-def process_episode(json_path: str, stride_distance: float = 0.25, use_smart_sampling: bool = True) -> Dict:
-    """Process a single episode and return action data."""
+def process_episode(json_path: str, window_size: int = WINDOW_SIZE,
+                    stride: int = WINDOW_STRIDE) -> Dict:
+    """Process a single episode and return action data.
+
+    Args:
+        json_path: Path to episode JSON file
+        window_size: Sliding window size (default 4)
+        stride: Sliding window stride (default 2)
+    """
     with open(json_path) as f:
         data = json.load(f)
 
@@ -193,75 +280,22 @@ def process_episode(json_path: str, stride_distance: float = 0.25, use_smart_sam
     if len(waypoints) < 2:
         return None
 
-    # Detect trajectory features for smart sampling
-    features = detect_trajectory_features(waypoints, units_in_meters)
+    # Step 1: Generate full action sequence from all waypoints
+    action_sequence = generate_full_action_sequence(waypoints, units_in_meters)
 
-    # Get sampled waypoint indices
-    if use_smart_sampling and USE_SMART_SAMPLING:
-        sampled_indices = smart_sample_waypoints(waypoints, features)
-    else:
-        sampled_indices = list(range(len(waypoints)))
+    if len(action_sequence) == 0:
+        return None
 
-    # Generate action samples from sampled waypoints
-    samples = []
-
-    for i in range(len(sampled_indices) - 1):
-        wp_idx = sampled_indices[i]
-        future_idx = sampled_indices[i + 1]
-
-        current_wp = waypoints[wp_idx]
-        future_wp = waypoints[future_idx]
-
-        # Check for anomalous distance
-        dx = (future_wp['xyz'][0] - current_wp['xyz'][0]) * units_in_meters
-        dy = (future_wp['xyz'][1] - current_wp['xyz'][1]) * units_in_meters
-        dist = math.sqrt(dx*dx + dy*dy)
-
-        if dist > MAX_SINGLE_STEP_DISTANCE:
-            continue  # Skip anomalous waypoints
-
-        # Convert to pose (with unit conversion)
-        current_pose = omninav_wp_to_pose(current_wp, units_in_meters)
-        future_pose = omninav_wp_to_pose(future_wp, units_in_meters)
-
-        # Generate actions
-        actions, raw_count = waypoint_to_actions(current_pose, future_pose)
-
-        # Calculate displacement and angle for verification
-        r = dist
-        yaw_diff = normalize_angle(future_pose['yaw'] - current_pose['yaw'])
-
-        # Video frame alignment
-        current_video_frame = get_video_frame(current_wp['time_s'])
-        future_video_frame = get_video_frame(future_wp['time_s'])
-
-        samples.append({
-            'wp_idx': wp_idx,
-            'future_wp_idx': future_idx,
-            'video_frame': current_video_frame,
-            'future_video_frame': future_video_frame,
-            'time_s': current_wp['time_s'],
-            'future_time_s': future_wp['time_s'],
-            'actions': actions,
-            'action_str': ' '.join(actions),
-            'raw_action_count': raw_count,
-            'displacement': r,
-            'yaw_change': math.degrees(yaw_diff),
-            'current_pose': current_pose,
-            'future_pose': future_pose,
-            'feature': features[wp_idx],
-        })
-
-    # Set last sample's actions to STOP
-    if len(samples) > 0:
-        samples[-1]['actions'] = ['stop'] * NUM_ACTIONS
-        samples[-1]['action_str'] = ' '.join(samples[-1]['actions'])
+    # Step 2: Apply sliding window to create samples
+    samples = sliding_window_samples(action_sequence, window_size, stride)
 
     return {
         'scene_id': scene_id,
         'instruction': instruction,
         'num_waypoints': len(waypoints),
-        'num_sampled': len(sampled_indices),
+        'total_actions': len(action_sequence),
+        'window_size': window_size,
+        'window_stride': stride,
         'samples': samples,
     }
 
@@ -313,17 +347,19 @@ def find_all_episodes(data_root: str, agent_types: List[str] = None,
 def main():
     parser = argparse.ArgumentParser(description='Preprocess OmniNavBench for action prediction')
     parser.add_argument('--data_root', type=str,
-                        default='/mnt/dataset/shuhzeng/OmniNavBench/OmniNavBenchData',
+                        default='/mnt/dataset/shuzheng/OmniNavBench/OmniNavBenchData',
                         help='Path to OmniNavBenchData directory')
     parser.add_argument('--output_root', type=str,
-                        default='/mnt/dataset/shuhzeng/OmniNavBench/OmniNavBenchActionData',
+                        default='/mnt/dataset/shuzheng/OmniNavBench/OmniNavBenchActionData',
                         help='Path to output OmniNavBenchActionData directory')
     parser.add_argument('--agent_types', type=str, nargs='+', default=None,
                         help='Agent types to process (default: car dog human)')
     parser.add_argument('--inst_types', type=str, nargs='+', default=None,
                         help='Instruction types to process (default: original concise first_person verbose)')
-    parser.add_argument('--stride_distance', type=float, default=0.25,
-                        help='Target distance between samples (meters)')
+    parser.add_argument('--window_size', type=int, default=WINDOW_SIZE,
+                        help='Sliding window size (default: 4)')
+    parser.add_argument('--window_stride', type=int, default=WINDOW_STRIDE,
+                        help='Sliding window stride (default: 2)')
     parser.add_argument('--split', type=str, default=None,
                         help='Only process specific split (train/test)')
     parser.add_argument('--limit', type=int, default=None,
@@ -334,10 +370,10 @@ def main():
                         help='Do not write files, just show what would be done')
     args = parser.parse_args()
 
-    print(f"=== Preprocessing OmniNavBench ===")
+    print(f"=== Preprocessing OmniNavBench (Sliding Window) ===")
     print(f"Data root: {args.data_root}")
     print(f"Output root: {args.output_root}")
-    print(f"Stride distance: {args.stride_distance}m")
+    print(f"Window size: {args.window_size}, Stride: {args.window_stride}")
     print(f"Parameters: FORWARD={FORWARD_DISTANCE}m, TURN={math.degrees(TURN_ANGLE)}°")
     print()
 
@@ -355,6 +391,7 @@ def main():
 
     # Process all episodes
     all_action_counts = Counter()
+    all_pattern_counts = Counter()
     total_samples = 0
     success_count = 0
     skip_count = 0
@@ -364,7 +401,7 @@ def main():
             print(f"Processing {i+1}/{len(episodes)}: {ep_info['inst_type']}/{ep_info['agent_type']}/{ep_info['scene']}/{ep_info['episode']}")
 
         try:
-            episode_data = process_episode(ep_info['json_path'], args.stride_distance)
+            episode_data = process_episode(ep_info['json_path'], args.window_size, args.window_stride)
 
             if episode_data is None or len(episode_data['samples']) == 0:
                 skip_count += 1
@@ -376,7 +413,7 @@ def main():
             episode_data['agent_type'] = ep_info['agent_type']
             episode_data['episode_id'] = ep_info['episode']
 
-            # Build output path: output_root/split/inst_type/agent_type/scene/episode/actions.json
+            # Build output path
             output_dir = Path(args.output_root) / ep_info['split'] / ep_info['inst_type'] / ep_info['agent_type'] / ep_info['scene'] / ep_info['episode']
             output_file = output_dir / 'actions.json'
 
@@ -388,15 +425,16 @@ def main():
 
             success_count += 1
 
-            # Count actions
+            # Count actions and patterns
             for sample in episode_data['samples']:
                 for action in sample['actions']:
                     all_action_counts[action] += 1
+                all_pattern_counts[tuple(sample['actions'])] += 1
                 total_samples += 1
 
             if args.verbose:
                 print(f"  -> {output_file}")
-                print(f"     {len(episode_data['samples'])} samples")
+                print(f"     {len(episode_data['samples'])} samples from {episode_data['total_actions']} actions")
 
         except Exception as e:
             print(f"  Error: {e}")
@@ -410,12 +448,29 @@ def main():
     print(f"Skipped: {skip_count} episodes")
     print(f"Total samples: {total_samples}")
     print()
+
     print("Action distribution:")
     total_actions = sum(all_action_counts.values())
     for action in ['forward', 'left', 'right', 'wait', 'stop']:
         count = all_action_counts.get(action, 0)
         pct = count / total_actions * 100 if total_actions > 0 else 0
         print(f"  {action}: {count} ({pct:.1f}%)")
+
+    print()
+    print("Top 15 action patterns:")
+    for pattern, count in all_pattern_counts.most_common(15):
+        pct = count / total_samples * 100 if total_samples > 0 else 0
+        print(f"  {list(pattern)}: {count} ({pct:.1f}%)")
+
+    # Count same vs mixed patterns
+    same_count = sum(1 for p in all_pattern_counts if len(set(p)) == 1)
+    mixed_count = len(all_pattern_counts) - same_count
+    same_samples = sum(c for p, c in all_pattern_counts.items() if len(set(p)) == 1)
+    mixed_samples = total_samples - same_samples
+    print()
+    print(f"Pattern diversity:")
+    print(f"  All same actions: {same_samples} samples ({same_samples/total_samples*100:.1f}%)")
+    print(f"  Mixed actions: {mixed_samples} samples ({mixed_samples/total_samples*100:.1f}%)")
 
     if args.dry_run:
         print()

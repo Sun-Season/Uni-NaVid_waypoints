@@ -42,6 +42,10 @@ from uninavid.model import *
 from uninavid.model.waypoint_head import LlavaWaypointForCausalLM, WaypointConfig
 from uninavid.mm_utils import tokenizer_image_token
 from uninavid.train.omninav_dataset import OmniNavDataArguments, make_omninav_data_module
+from uninavid.train.omninav_action_dataset import (
+    OmniNavActionDataArguments,
+    OmniNavActionDataset,
+)
 
 from PIL import Image
 from decord import VideoReader, cpu
@@ -155,6 +159,18 @@ class DataArguments:
     omninav_video_fps: Optional[int] = field(default=30)
     omninav_num_future_waypoints: Optional[int] = field(default=5)
     omninav_waypoint_stride: Optional[int] = field(default=5)
+    omninav_sample_stride: Optional[int] = field(default=10)  # 遍历轨迹时的采样间隔（每个 waypoint 约 5 米）
+    # OmniNav Action 训练参数
+    use_omninav_action: bool = field(default=False)
+    omninav_action_root: Optional[str] = field(default=None)
+    omninav_action_video_root: Optional[str] = field(default=None)
+    omninav_action_inst_types: Optional[str] = field(default="original,concise,first_person,verbose")
+    omninav_action_agent_types: Optional[str] = field(default="car,dog,human")
+    omninav_action_video_fps: Optional[int] = field(default=1)
+    # 验证集划分参数
+    val_split_ratio: float = field(default=0.1)
+    val_split_seed: int = field(default=42)
+    val_split_by_episode: bool = field(default=True)
 
 
 @dataclass
@@ -192,6 +208,7 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length: bool = field(default=False)
     lr_multi: Optional[str] = field(default=None)
     tune_vision_encoder: bool = field(default=False)
+    tune_mm_projector_with_lora: bool = field(default=False)  # LoRA 模式下是否同时训练 mm_projector
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -1200,6 +1217,57 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
                 data_collator=data_collator)
 
 
+def make_omninav_action_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+    """创建 OmniNav Action 数据集"""
+    inst_types = [t.strip() for t in data_args.omninav_action_inst_types.split(',')]
+    agent_types = [t.strip() for t in data_args.omninav_action_agent_types.split(',')]
+
+    # 创建训练集
+    train_data_args = OmniNavActionDataArguments(
+        action_root=data_args.omninav_action_root,
+        video_root=data_args.omninav_action_video_root,
+        split='train',
+        inst_types=inst_types,
+        agent_types=agent_types,
+        video_fps=data_args.omninav_action_video_fps,
+        image_processor=data_args.image_processor,
+        mm_use_im_start_end=data_args.mm_use_im_start_end,
+        is_multimodal=True,
+        val_split_ratio=data_args.val_split_ratio,
+        val_split_seed=data_args.val_split_seed,
+        val_split_by_episode=data_args.val_split_by_episode,
+    )
+
+    train_dataset = OmniNavActionDataset(tokenizer=tokenizer, data_args=train_data_args)
+
+    # 创建验证集（禁用oversampling）
+    val_data_args = OmniNavActionDataArguments(
+        action_root=data_args.omninav_action_root,
+        video_root=data_args.omninav_action_video_root,
+        split='val',
+        inst_types=inst_types,
+        agent_types=agent_types,
+        video_fps=data_args.omninav_action_video_fps,
+        image_processor=data_args.image_processor,
+        mm_use_im_start_end=data_args.mm_use_im_start_end,
+        is_multimodal=True,
+        enable_oversampling=False,  # 验证集禁用oversampling
+        val_split_ratio=data_args.val_split_ratio,
+        val_split_seed=data_args.val_split_seed,
+        val_split_by_episode=data_args.val_split_by_episode,
+    )
+
+    eval_dataset = OmniNavActionDataset(tokenizer=tokenizer, data_args=val_data_args)
+
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
+    return dict(
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,  # 不再是None
+        data_collator=data_collator,
+    )
+
+
 def train():
     global local_rank
 
@@ -1322,6 +1390,14 @@ def train():
             rank0_print(f"Restored waypoint_head requires_grad: "
                         f"{sum(p.numel() for p in waypoint_head.parameters())} params unfrozen")
 
+        # LoRA 模式下解冻 mm_projector
+        if training_args.tune_mm_projector_with_lora:
+            mm_projector = model.base_model.model.get_model().mm_projector
+            for p in mm_projector.parameters():
+                p.requires_grad = True
+            rank0_print(f"Restored mm_projector requires_grad: "
+                        f"{sum(p.numel() for p in mm_projector.parameters())} params unfrozen")
+
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -1430,11 +1506,19 @@ def train():
             max_frames=data_args.omninav_max_frames,
             num_future_waypoints=data_args.omninav_num_future_waypoints,
             waypoint_stride=data_args.omninav_waypoint_stride,
+            sample_stride=data_args.omninav_sample_stride,
             image_processor=data_args.image_processor,
             mm_use_im_start_end=data_args.mm_use_im_start_end,
             is_multimodal=True,
         )
         data_module = make_omninav_data_module(tokenizer=tokenizer, data_args=omninav_data_args)
+    elif data_args.use_omninav_action:
+        if data_args.omninav_action_root is None or data_args.omninav_action_video_root is None:
+            raise ValueError(
+                "`--omninav_action_root` and `--omninav_action_video_root` are required when "
+                "`--use_omninav_action True`"
+            )
+        data_module = make_omninav_action_data_module(tokenizer=tokenizer, data_args=data_args)
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer,
                                                   data_args=data_args)

@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Model and data paths
-PREV_MODEL="/mnt/dataset/wj_zqc/VLN/model/uninavid-7b-full-224-video-fps-1-grid-2"
-VISION_TOWER="/mnt/dataset/wj_zqc/VLN/model/eva_vit_g.pth"
-DATA_BASE_PATH="/mnt/dataset/ssz/OmniNavBench/OmniNavBenchData/train"
-VIDEO_BASE_PATH="/mnt/dataset/ssz/OmniNavBench/OmniNavBenchVideos/train"
+PREV_MODEL="/mnt/dataset/shuzheng/model/uninavid-7b-full-224-video-fps-1-grid-2"
+VISION_TOWER="/mnt/dataset/shuzheng/model/eva_vit_g.pth"
+DATA_BASE_PATH="/mnt/dataset/shuzheng/OmniNavBench/OmniNavBenchData/train"
+VIDEO_BASE_PATH="/mnt/dataset/shuzheng/OmniNavBench/OmniNavBenchVideos/train"
 OUTPUT_DIR="./model_zoo/uninavid-7b-omninav-waypoint"
 
 # Training hyperparameters

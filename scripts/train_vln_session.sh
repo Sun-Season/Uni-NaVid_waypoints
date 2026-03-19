@@ -6,9 +6,9 @@ source activate base
 conda activate uninavid
 
 # Set paths
-MODEL_PATH="/mnt/dataset/wj_zqc/VLN/model/uninavid-7b-full-224-video-fps-1-grid-2"  # Pretrained model
-VISION_TOWER="/mnt/dataset/wj_zqc/VLN/model/eva_vit_g.pth"  # Vision tower
-DATA_PATH="/mnt/dataset/wj_zqc/ssz/Uni-NaVid_waypoints/passed_samples"  # VLN session directory
+MODEL_PATH="/mnt/dataset/shuzheng/model/uninavid-7b-full-224-video-fps-1-grid-2"  # Pretrained model
+VISION_TOWER="/mnt/dataset/shuzheng/model/eva_vit_g.pth"  # Vision tower
+DATA_PATH="/mnt/dataset/shuzheng/Uni-NaVid_waypoints/passed_samples"  # VLN session directory
 OUTPUT_DIR="output/vln_session_waypoint_$(date +%Y%m%d_%H%M%S)"
 
 # Training hyperparameters

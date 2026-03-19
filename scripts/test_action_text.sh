@@ -11,8 +11,8 @@ CUDA_VISIBLE_DEVICES=0 deepspeed train_vln_action_text.py \
     --lora_r 64 \
     --lora_alpha 128 \
     --lora_dropout 0.05 \
-    --data_path /mnt/dataset/wj_zqc/ssz/Uni-NaVid_waypoints/passed_samples \
-    --vision_tower /mnt/dataset/wj_zqc/VLN/model/eva_vit_g.pth \
+    --data_path /mnt/dataset/shuzheng/Uni-NaVid_waypoints/passed_samples \
+    --vision_tower /mnt/dataset/shuzheng/model/eva_vit_g.pth \
     --image_processor ./uninavid/processor/clip-patch14-224 \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \

@@ -140,7 +140,7 @@ class ActionTextEvaluator:
         prompt_template = (
             "This is a navigation video. The instruction is: {}\n"
             "Based on the visual observation and instruction, determine your next four actions. "
-            "The predicted action should be one of the following: forward, left, right, or wait."
+            "The predicted action should be one of the following: forward, left, right, wait, or stop."
         )
         question = prompt_template.format(instruction)
         qs = DEFAULT_IMAGE_TOKEN + '\n' + question
@@ -216,8 +216,7 @@ class ActionTextEvaluator:
         actions = []
         for word in output.lower().split():
             if word in valid_actions:
-                # Map 'stop' to 'wait' for consistency
-                actions.append('wait' if word == 'stop' else word)
+                actions.append(word)
 
         # Pad or truncate to NUM_ACTIONS
         if len(actions) == 0:
@@ -363,7 +362,7 @@ def main():
     exact_matches = 0
     first_correct_total = 0
 
-    action_confusion = {a: Counter() for a in ['forward', 'left', 'right', 'wait']}
+    action_confusion = {a: Counter() for a in ['forward', 'left', 'right', 'wait', 'stop']}
 
     for sample in tqdm(samples, desc="Evaluating"):
         result = evaluate_sample(
@@ -408,14 +407,14 @@ def main():
     print(f"First action accuracy: {first_action_accuracy:.2%} ({first_correct_total}/{len(samples)})")
 
     print("\nPer-action accuracy:")
-    for action in ['forward', 'left', 'right', 'wait']:
+    for action in ['forward', 'left', 'right', 'wait', 'stop']:
         total = sum(action_confusion[action].values())
         correct = action_confusion[action][action]
         acc = correct / total if total > 0 else 0
         print(f"  {action}: {acc:.2%} ({correct}/{total})")
 
     print("\nConfusion matrix (rows=GT, cols=Pred):")
-    actions = ['forward', 'left', 'right', 'wait']
+    actions = ['forward', 'left', 'right', 'wait', 'stop']
     print("         " + " ".join(f"{a:>8}" for a in actions))
     for gt in actions:
         row = [action_confusion[gt][pred] for pred in actions]

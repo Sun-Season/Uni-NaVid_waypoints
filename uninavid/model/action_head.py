@@ -44,6 +44,7 @@ class ActionModelOutput(CausalLMOutputWithPast):
     """Output of action prediction model."""
     action_logits: Optional[torch.FloatTensor] = None  # [batch, num_future_actions, num_actions]
     action_loss: Optional[torch.FloatTensor] = None
+    lm_loss: Optional[torch.FloatTensor] = None  # 添加lm_loss
 
 
 class ActionHead(nn.Module):
@@ -229,6 +230,7 @@ class LlavaActionForCausalLM(LlavaLlamaAttForCausalLM):
             attentions=outputs.attentions,
             action_logits=action_logits,
             action_loss=action_loss,
+            lm_loss=lm_loss,  # 添加lm_loss到输出
         )
 
     def predict_actions(

@@ -154,6 +154,21 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        重写compute_loss以记录loss组件（lm_loss和action_loss）
+        """
+        outputs = model(**inputs)
+        loss = outputs.loss
+
+        # 记录loss组件到日志
+        if hasattr(outputs, 'lm_loss') and outputs.lm_loss is not None:
+            self.log({'lm_loss': outputs.lm_loss.item()})
+        if hasattr(outputs, 'action_loss') and outputs.action_loss is not None:
+            self.log({'action_loss': outputs.action_loss.item()})
+
+        return (loss, outputs) if return_outputs else loss
+
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None

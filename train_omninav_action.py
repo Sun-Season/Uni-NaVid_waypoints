@@ -71,6 +71,10 @@ class DataArguments:
     is_multimodal: bool = True
     image_aspect_ratio: str = 'square'
     max_frames: int = field(default=16)
+    # 验证集划分参数
+    val_split_ratio: float = field(default=0.1)
+    val_split_seed: int = field(default=42)
+    val_split_by_episode: bool = field(default=True)
 
 
 @dataclass
@@ -244,23 +248,47 @@ def make_omninav_action_data_module(
     inst_types = [t.strip() for t in data_args.inst_types.split(',')]
     agent_types = [t.strip() for t in data_args.agent_types.split(',')]
 
-    # Create data arguments
-    omninav_data_args = OmniNavActionDataArguments(
+    # 创建训练集
+    train_data_args = OmniNavActionDataArguments(
         action_root=data_args.action_root,
         video_root=data_args.video_root,
-        split=data_args.split,
+        split='train',
         inst_types=inst_types,
         agent_types=agent_types,
         max_frames=data_args.max_frames,
         image_aspect_ratio=data_args.image_aspect_ratio,
         mm_use_im_start_end=model_args.mm_use_im_start_end,
         is_multimodal=data_args.is_multimodal,
+        val_split_ratio=data_args.val_split_ratio,
+        val_split_seed=data_args.val_split_seed,
+        val_split_by_episode=data_args.val_split_by_episode,
     )
 
-    # Create dataset
     train_dataset = OmniNavActionDataset(
         tokenizer=tokenizer,
-        data_args=omninav_data_args,
+        data_args=train_data_args,
+    )
+
+    # 创建验证集（禁用oversampling）
+    val_data_args = OmniNavActionDataArguments(
+        action_root=data_args.action_root,
+        video_root=data_args.video_root,
+        split='val',
+        inst_types=inst_types,
+        agent_types=agent_types,
+        max_frames=data_args.max_frames,
+        image_aspect_ratio=data_args.image_aspect_ratio,
+        mm_use_im_start_end=model_args.mm_use_im_start_end,
+        is_multimodal=data_args.is_multimodal,
+        enable_oversampling=False,  # 验证集禁用oversampling
+        val_split_ratio=data_args.val_split_ratio,
+        val_split_seed=data_args.val_split_seed,
+        val_split_by_episode=data_args.val_split_by_episode,
+    )
+
+    eval_dataset = OmniNavActionDataset(
+        tokenizer=tokenizer,
+        data_args=val_data_args,
     )
 
     # Create data collator
@@ -268,7 +296,7 @@ def make_omninav_action_data_module(
 
     return dict(
         train_dataset=train_dataset,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,  # 不再是None
         data_collator=data_collator,
     )
 

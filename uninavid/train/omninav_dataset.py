@@ -6,7 +6,6 @@ import os
 import copy
 import json
 import math
-import random
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -39,6 +38,7 @@ class OmniNavDataArguments:
     max_frames: int = 32  # 最大采样帧数
     num_future_waypoints: int = 5  # 要预测的未来航点数量
     waypoint_stride: int = 5  # 采样未来航点的步长
+    sample_stride: int = 5  # 遍历轨迹时的采样间隔（每个 waypoint 约 5cm，stride=5 约等于每 0.25m 采样一个训练点）
     image_processor: Optional[object] = None  # 图像处理器
     mm_use_im_start_end: bool = False  # 是否使用图像开始/结束标记
     is_multimodal: bool = True  # 是否为多模态数据集
@@ -203,21 +203,25 @@ class OmniNavBenchDataset(Dataset):
         self.tokenizer = tokenizer
         self.data_args = data_args
 
-        # 构建样本列表
+        # 构建样本列表（展开所有采样点）
         self.samples = self._build_sample_list()
         print(f"OmniNavBenchDataset: Loaded {len(self.samples)} samples")
 
     def _build_sample_list(self) -> List[dict]:
-        """构建所有训练样本的列表"""
+        """构建所有训练样本的列表 - 按时间间隔遍历轨迹生成采样点"""
         samples = []
         missing_video_count = 0
+        skipped_short_traj = 0
 
         agent_types = self.data_args.agent_types or ['human', 'car', 'dog']
-        # 如果未指定，加载所有指令类型
         instruction_types = self.data_args.instruction_types or ['original', 'concise', 'verbose', 'first_person']
 
         data_base = self.data_args.data_base_path
         video_base = self.data_args.video_base_path
+
+        num_future = self.data_args.num_future_waypoints
+        waypoint_stride = self.data_args.waypoint_stride
+        sample_stride = self.data_args.sample_stride
 
         for instruction_type in instruction_types:
             for agent_type in agent_types:
@@ -247,23 +251,60 @@ class OmniNavBenchDataset(Dataset):
                         rgb_video_path = os.path.join(video_dir, 'rgb.mp4')
                         depth_video_path = os.path.join(video_dir, 'depth.mp4')
 
-                        # 检查视频是否存在
+                        # 检查视频是否存在且可读
                         if not os.path.exists(rgb_video_path):
                             missing_video_count += 1
                             continue
 
-                        samples.append({
-                            'json_path': json_path,
-                            'rgb_video_path': rgb_video_path,
-                            'depth_video_path': depth_video_path,
-                            'agent_type': agent_type,
-                            'scene': scene,
-                            'episode': episode_name,
-                            'instruction_type': instruction_type,  # 跟踪指令类型
-                        })
+                        # 验证视频文件是否可读（与 action dataset 保持一致）
+                        try:
+                            import cv2
+                            cap = cv2.VideoCapture(rgb_video_path)
+                            if not cap.isOpened():
+                                cap.release()
+                                missing_video_count += 1
+                                continue
+                            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            cap.release()
+                            if frame_count <= 0:
+                                missing_video_count += 1
+                                continue
+                        except Exception:
+                            missing_video_count += 1
+                            continue
+
+                        # 加载轨迹数据，计算可采样的点
+                        try:
+                            with open(json_path, 'r') as f:
+                                data = json.load(f)
+                            waypoints = data['scenarios'][0]['robots']['entries'][0].get('rb_gt_waypoints', [])
+                        except Exception:
+                            continue
+
+                        # 计算可采样的最大索引
+                        # 需要: current_idx + num_future * waypoint_stride < len(waypoints)
+                        max_idx = len(waypoints) - num_future * waypoint_stride - 1
+                        if max_idx <= 0:
+                            skipped_short_traj += 1
+                            continue
+
+                        # 按 waypoint 步长采样（每个 waypoint 约 5 米，sample_stride=10 约等于每 50 米采样一次）
+                        for current_idx in range(0, max_idx + 1, sample_stride):
+                            samples.append({
+                                'json_path': json_path,
+                                'rgb_video_path': rgb_video_path,
+                                'depth_video_path': depth_video_path,
+                                'agent_type': agent_type,
+                                'scene': scene,
+                                'episode': episode_name,
+                                'instruction_type': instruction_type,
+                                'current_idx': current_idx,
+                            })
 
         if missing_video_count > 0:
-            print(f"OmniNavBenchDataset: skipped {missing_video_count} samples without rgb.mp4")
+            print(f"OmniNavBenchDataset: skipped {missing_video_count} episodes without rgb.mp4")
+        if skipped_short_traj > 0:
+            print(f"OmniNavBenchDataset: skipped {skipped_short_traj} episodes with insufficient waypoints")
 
         return samples
 
@@ -311,27 +352,6 @@ class OmniNavBenchDataset(Dataset):
 
         return goal_position, success_radius
 
-    def _sample_training_point(
-        self,
-        waypoints: List[dict],
-        num_future: int,
-        stride: int = 5
-    ) -> int:
-        """
-        在轨迹中随机采样一个训练点
-        确保有足够的未来航点（考虑步长）
-
-        Args:
-            waypoints: 航点列表
-            num_future: 要预测的未来航点数量
-            stride: 采样航点的步长
-        """
-        # 需要: current_idx + num_future * stride < len(waypoints)
-        max_idx = len(waypoints) - num_future * stride - 1
-        if max_idx <= 0:
-            return 0
-        return random.randint(0, max_idx)
-    
     def _load_video_frames(
         self,
         video_path: str,
@@ -410,19 +430,8 @@ class OmniNavBenchDataset(Dataset):
                 # 获取坐标转换的单位
                 units_in_meters = data['scenarios'][0]['scene'].get('units_in_meters', 1.0)
 
-                if len(waypoints) < self.data_args.num_future_waypoints + 2:
-                    if retry < max_retries - 1:
-                        continue
-                    raise ValueError(
-                        f"Sample has insufficient waypoints ({len(waypoints)}): {sample['json_path']}"
-                    )
-
-                # 采样一个训练点
-                current_idx = self._sample_training_point(
-                    waypoints,
-                    self.data_args.num_future_waypoints,
-                    self.data_args.waypoint_stride
-                )
+                # 使用预计算的采样点索引（不再随机采样）
+                current_idx = sample['current_idx']
 
                 # 加载视频帧
                 video_frames = self._load_video_frames(
