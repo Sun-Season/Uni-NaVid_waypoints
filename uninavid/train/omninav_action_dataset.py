@@ -56,14 +56,15 @@ class OmniNavActionDataArguments:
     mm_use_im_start_end: bool = field(default=False)
     is_multimodal: bool = field(default=True)
     image_aspect_ratio: str = field(default='pad')
-    # 过采样配置 (方案E: forward:38.6%, left:19.1%, right:20.9%, wait:11.5%, stop:9.9%)
+    # 过采样配置 (控制总样本数，避免训练时间过长)
+    # 策略：适度oversample，总样本数约为原始的2倍 (~28000)
     enable_oversampling: bool = field(default=True)
-    oversample_pure_forward: float = field(default=0.05)  # 下采样到5%
-    oversample_majority_left: int = field(default=4)
-    oversample_majority_right: int = field(default=5)
-    oversample_has_wait: int = field(default=18)
-    oversample_has_stop: int = field(default=5)
-    oversample_mixed_turn: int = field(default=1)
+    oversample_pure_forward: float = field(default=0.05)  # 下采样到5% (10000->500)
+    oversample_majority_left: int = field(default=8)      # 上采样8倍 (1000->8000)
+    oversample_majority_right: int = field(default=8)     # 上采样8倍 (1000->8000)
+    oversample_has_wait: int = field(default=10)          # 上采样10倍 (500->5000)
+    oversample_has_stop: int = field(default=10)          # 上采样10倍 (500->5000)
+    oversample_mixed_turn: float = field(default=1.5)     # 上采样1.5倍 (1000->1500)
     # 验证集划分配置
     val_split_ratio: float = field(default=0.1)  # 从train中划分10%作为验证集
     val_split_seed: int = field(default=42)  # 固定随机种子保证可复现
@@ -198,15 +199,18 @@ class OmniNavActionDataset(Dataset):
     def _apply_oversampling(self, samples: List[tuple]) -> List[tuple]:
         """Apply oversampling based on sample categories.
 
-        Oversampling strategy (方案E):
-        - pure_forward: downsample to 5% (multiply by 0.05)
-        - majority_left: oversample 4x
-        - majority_right: oversample 5x
-        - has_wait: oversample 18x
-        - has_stop: oversample 5x
-        - mixed_turn: keep as is (1x)
+        Oversampling strategy (控制总样本数方案):
+        - pure_forward: downsample to 5% (multiply by 0.05, 10000->500)
+        - majority_left: oversample 8x (1000->8000)
+        - majority_right: oversample 8x (1000->8000)
+        - has_wait: oversample 10x (500->5000)
+        - has_stop: oversample 10x (500->5000)
+        - mixed_turn: oversample 1.5x (1000->1500)
 
-        Target distribution: forward:~40%, left:~20%, right:~20%, wait:~10%, stop:~10%
+        Total samples: ~28000 (2x original), balancing training time and data balance.
+
+        Uses random sampling with replacement to increase diversity and
+        prevent overfitting to repeated samples.
         """
         # Group samples by category
         categories = {
@@ -239,14 +243,16 @@ class OmniNavActionDataset(Dataset):
             self.CAT_MIXED_TURN: self.data_args.oversample_mixed_turn,
         }
 
-        # Apply sampling
+        # Apply sampling with random selection to increase diversity
         result = []
         for cat, mult in multipliers.items():
             cat_samples = categories[cat]
             if mult >= 1:
-                # Oversample: repeat samples
-                for _ in range(int(mult)):
-                    result.extend(cat_samples)
+                # Oversample: randomly sample with replacement to increase diversity
+                target_count = int(len(cat_samples) * mult)
+                if target_count > 0:
+                    # Use random.choices (with replacement) instead of simple repetition
+                    result.extend(random.choices(cat_samples, k=target_count))
             else:
                 # Downsample: randomly select subset
                 n = int(len(cat_samples) * mult)
@@ -324,17 +330,27 @@ class OmniNavActionDataset(Dataset):
                         if not os.path.exists(video_path):
                             continue
 
-                        # Check if video is valid (can be opened and has frames)
+                        # Check if video is valid (can be opened, has frames, and can read frames)
                         try:
                             cap = cv2.VideoCapture(video_path)
                             if not cap.isOpened():
+                                print(f"  Warning: Cannot open video: {video_path}")
                                 cap.release()
                                 continue
                             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                            cap.release()
                             if frame_count <= 0:
+                                print(f"  Warning: Video has no frames: {video_path}")
+                                cap.release()
                                 continue
-                        except Exception:
+
+                            # Try to read the first frame to ensure video is not corrupted
+                            ret, frame = cap.read()
+                            cap.release()
+                            if not ret or frame is None:
+                                print(f"  Warning: Cannot read frames from video: {video_path}")
+                                continue
+                        except Exception as e:
+                            print(f"  Warning: Error checking video {video_path}: {e}")
                             continue
 
                         # Load actions.json
@@ -421,12 +437,16 @@ class OmniNavActionDataset(Dataset):
         share the same video files.
         ep_key format: inst_type/agent_type/scene_id/episode_id
         video path: video_root/split/agent_type/scene_id/episode_id/rgb.mp4
+
+        For val split, videos are still in 'train' directory since we split
+        train data into train/val.
         """
         parts = ep_key.split('/')
         # Skip inst_type (index 0), use agent_type, scene_id, episode_id
         inst_type, agent_type, scene_id, episode_id = parts
         video_root = self.data_args.video_root
-        split = self.data_args.split
+        # Use 'train' for both train and val splits (val is split from train data)
+        split = 'train' if self.data_args.split in ['train', 'val'] else self.data_args.split
         return os.path.join(video_root, split, agent_type, scene_id, episode_id, 'rgb.mp4')
 
     def _load_video_frames(self, video_path: str, ep_key: str, sample_idx: int) -> np.ndarray:

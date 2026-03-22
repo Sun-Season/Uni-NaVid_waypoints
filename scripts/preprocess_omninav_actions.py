@@ -15,12 +15,12 @@
 动作生成逻辑:
 - Wait: 相邻 waypoint 时间间隔 > 1秒
 - Turn: 累积 yaw 变化达到 ±20° 生成 left/right
-- Forward: 累积位移达到 0.25m 生成 forward
+- Forward: 累积位移达到 0.5m 生成 forward（减少forward主导）
 - Stop: 轨迹结束
 
 特性:
-- 滑动窗口采样：先生成完整动作序列，再用滑动窗口切分成样本
-- 窗口大小=4，步长=2，每个样本包含4个真实动作
+- 无重叠采样：窗口大小=4，步长=4，每个样本包含4个独立的动作
+- 样本之间完全独立，无时序混乱问题
 """
 
 import os
@@ -32,16 +32,16 @@ from collections import Counter
 from pathlib import Path
 
 # Waypoint to action conversion parameters
-FORWARD_DISTANCE = 0.25  # meters per forward action
+FORWARD_DISTANCE = 0.5  # meters per forward action (changed from 0.25 to reduce forward dominance)
 TURN_ANGLE = 20.0  # degrees per turn action
 WAIT_TIME_THRESHOLD = 2.0  # seconds, time gap > this triggers wait
 WAIT_TIME_PER_ACTION = 2.0  # seconds per wait action
 STATIONARY_THRESHOLD = 0.03  # meters, if displacement < this, consider as stationary
 VIDEO_FPS = 30  # video frame rate
 
-# Sliding window parameters
+# Sampling parameters (NO OVERLAP)
 WINDOW_SIZE = 4  # number of actions per sample
-WINDOW_STRIDE = 2  # step size for sliding window
+WINDOW_STRIDE = 4  # step size for sampling (equal to window_size = no overlap)
 
 MAX_SINGLE_STEP_DISTANCE = 2.0  # max distance between adjacent waypoints (meters)
 
@@ -183,12 +183,12 @@ def generate_full_action_sequence(waypoints: List[dict], units_in_meters: float)
 def sliding_window_samples(action_sequence: List[dict],
                            window_size: int = WINDOW_SIZE,
                            stride: int = WINDOW_STRIDE) -> List[dict]:
-    """Apply sliding window to action sequence to create samples.
+    """Apply non-overlapping sampling to action sequence to create samples.
 
     Args:
         action_sequence: Full action sequence with metadata
         window_size: Number of actions per sample (default 4)
-        stride: Step size for sliding window (default 2)
+        stride: Step size for sampling (default 4, equal to window_size for no overlap)
 
     Returns:
         List of samples, each with 'actions' and metadata
@@ -212,7 +212,8 @@ def sliding_window_samples(action_sequence: List[dict],
             })
         return samples
 
-    # Sliding window
+    # Non-overlapping sampling - do NOT handle remaining actions
+    # to avoid overlap. It's acceptable to not cover the last few actions.
     for i in range(0, len(action_sequence) - window_size + 1, stride):
         window = action_sequence[i:i + window_size]
         actions = [a['action'] for a in window]
@@ -231,28 +232,6 @@ def sliding_window_samples(action_sequence: List[dict],
             'actions': actions,
             'action_str': ' '.join(actions),
         })
-
-    # Handle remaining actions (if any) - ensure we include the end
-    last_start = (len(action_sequence) - window_size) // stride * stride
-    if last_start + window_size < len(action_sequence):
-        # There are remaining actions not covered
-        remaining_start = len(action_sequence) - window_size
-        if remaining_start > last_start:
-            window = action_sequence[remaining_start:]
-            actions = [a['action'] for a in window]
-            first_entry = window[0]
-            last_entry = window[-1]
-
-            samples.append({
-                'wp_idx': first_entry['wp_idx'],
-                'future_wp_idx': last_entry['future_wp_idx'],
-                'video_frame': first_entry['video_frame'],
-                'future_video_frame': last_entry['video_frame'],
-                'time_s': first_entry['time_s'],
-                'future_time_s': last_entry['time_s'],
-                'actions': actions,
-                'action_str': ' '.join(actions),
-            })
 
     return samples
 

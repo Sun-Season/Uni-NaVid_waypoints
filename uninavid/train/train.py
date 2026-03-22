@@ -1233,6 +1233,7 @@ def make_omninav_action_data_module(tokenizer: transformers.PreTrainedTokenizer,
         image_processor=data_args.image_processor,
         mm_use_im_start_end=data_args.mm_use_im_start_end,
         is_multimodal=True,
+        enable_oversampling=True,   # 训练集启用oversampling
         val_split_ratio=data_args.val_split_ratio,
         val_split_seed=data_args.val_split_seed,
         val_split_by_episode=data_args.val_split_by_episode,
@@ -1522,6 +1523,32 @@ def train():
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer,
                                                   data_args=data_args)
+
+    # Load action token weights for class balancing (after all model setup is complete)
+    import json
+    import os
+    weights_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'action_token_weights.json')
+    if os.path.exists(weights_file):
+        with open(weights_file, 'r') as f:
+            weight_config = json.load(f)
+        token_weight_dict = {int(k): v for k, v in weight_config['token_weight_dict'].items()}
+        model.config.action_token_weights = token_weight_dict
+        action_weights = weight_config.get('action_weights', {})
+        weight_summary = ", ".join(
+            f"{action}={weight:g}" for action, weight in action_weights.items()
+        ) or "N/A"
+        shared_token_ids = weight_config.get('shared_token_ids', {})
+        rank0_print(f"\n{'='*60}")
+        rank0_print(f"✓ Loaded action token weights from {weights_file}")
+        rank0_print(f"  Applied weights to {len(token_weight_dict)} tokens")
+        rank0_print(f"  Action weights: {weight_summary}")
+        if shared_token_ids:
+            rank0_print(f"  Skipped shared tokens: {len(shared_token_ids)}")
+        rank0_print(f"{'='*60}\n")
+    else:
+        rank0_print(f"\n⚠ Action token weights file not found at {weights_file}")
+        rank0_print(f"  Training will use default (unweighted) loss\n")
+
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,

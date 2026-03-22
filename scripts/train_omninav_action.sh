@@ -2,6 +2,10 @@
 source /opt/conda/etc/profile.d/conda.sh
 conda activate uninavid
 
+export WANDB_API_KEY="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"
+export WANDB_PROJECT="omninav-action"
+export WANDB_NAME="omninav_action_lora_321"
+
 # Model path (Uni-NaVid base model)
 MODEL_PATH="/mnt/dataset/shuzheng/model/uninavid-7b-full-224-video-fps-1-grid-2"
 VISION_TOWER="/mnt/dataset/shuzheng/model/eva_vit_g.pth"
@@ -11,8 +15,8 @@ IMAGE_PROCESSOR="/mnt/dataset/shuzheng/Uni-NaVid_waypoints/uninavid/processor/cl
 ACTION_ROOT="/mnt/dataset/shuzheng/OmniNavBench/OmniNavBenchActionData"
 VIDEO_ROOT="/mnt/dataset/shuzheng/OmniNavBench/OmniNavBenchVideos"
 
-# Output directory
-OUTPUT_DIR="/mnt/dataset/shuzheng/Uni-NaVid_waypoints/checkpoints/omninav_action_lora_official"
+# Output directory (new training with improved data: no overlap + 0.5m threshold + oversampling)
+OUTPUT_DIR="/mnt/dataset/shuzheng/Uni-NaVid_waypoints/checkpoints/omninav_action_lora_321"
 
 # Instruction types and agent types (comma-separated)
 INST_TYPES="original,concise,first_person,verbose"
@@ -21,7 +25,7 @@ AGENT_TYPES="car,dog,human"
 # Set PYTHONPATH
 export PYTHONPATH="/mnt/dataset/shuzheng/Uni-NaVid_waypoints:$PYTHONPATH"
 
-deepspeed --num_gpus=1 /mnt/dataset/shuzheng/Uni-NaVid_waypoints/uninavid/train/train_mem.py \
+deepspeed --num_gpus=8 /mnt/dataset/shuzheng/Uni-NaVid_waypoints/uninavid/train/train_mem.py \
     --deepspeed /mnt/dataset/shuzheng/Uni-NaVid_waypoints/scripts/zero2.json \
     --model_name_or_path $MODEL_PATH \
     --vision_tower $VISION_TOWER \
@@ -42,18 +46,18 @@ deepspeed --num_gpus=1 /mnt/dataset/shuzheng/Uni-NaVid_waypoints/uninavid/train/
     --image_aspect_ratio pad \
     --bf16 True \
     --output_dir $OUTPUT_DIR \
-    --num_train_epochs 4 \
+    --num_train_epochs 2 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 2 \
     --gradient_accumulation_steps 2 \
     --evaluation_strategy "steps" \
-    --eval_steps 250 \
+    --eval_steps 2500 \
     --val_split_ratio 0.1 \
     --val_split_seed 42 \
     --val_split_by_episode True \
     --save_strategy "steps" \
-    --save_steps 250 \
-    --save_total_limit 3 \
+    --save_steps 5000 \
+    --save_total_limit 10 \
     --learning_rate 1.5e-4 \
     --weight_decay 0.01 \
     --warmup_ratio 0.03 \
@@ -66,4 +70,5 @@ deepspeed --num_gpus=1 /mnt/dataset/shuzheng/Uni-NaVid_waypoints/uninavid/train/
     --lora_r 128 \
     --lora_alpha 256 \
     --lora_dropout 0.05 \
-    --tune_mm_projector True
+    --tune_mm_projector True \
+    --report_to wandb

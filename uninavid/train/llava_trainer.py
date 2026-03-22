@@ -161,13 +161,35 @@ class LLaVATrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss
 
-        # 记录loss组件到日志
+        # 将loss组件存储到outputs中，以便在日志中显示
+        # 这些会被自动记录到wandb和tensorboard
         if hasattr(outputs, 'lm_loss') and outputs.lm_loss is not None:
-            self.log({'lm_loss': outputs.lm_loss.item()})
+            # 存储到trainer的state中
+            if not hasattr(self, '_lm_losses'):
+                self._lm_losses = []
+            self._lm_losses.append(outputs.lm_loss.item())
+
         if hasattr(outputs, 'action_loss') and outputs.action_loss is not None:
-            self.log({'action_loss': outputs.action_loss.item()})
+            if not hasattr(self, '_action_losses'):
+                self._action_losses = []
+            self._action_losses.append(outputs.action_loss.item())
 
         return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs):
+        """
+        重写log方法，添加lm_loss和action_loss的平均值
+        """
+        # 添加loss组件的平均值
+        if hasattr(self, '_lm_losses') and len(self._lm_losses) > 0:
+            logs['lm_loss'] = sum(self._lm_losses) / len(self._lm_losses)
+            self._lm_losses = []  # 清空
+
+        if hasattr(self, '_action_losses') and len(self._action_losses) > 0:
+            logs['action_loss'] = sum(self._action_losses) / len(self._action_losses)
+            self._action_losses = []  # 清空
+
+        super().log(logs)
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):

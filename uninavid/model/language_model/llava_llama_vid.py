@@ -35,6 +35,11 @@ os.environ["WANDB_MODE"] = "offline"
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
+    def __init__(self, action_token_weights=None, **kwargs):
+        super().__init__(**kwargs)
+        # Dictionary mapping token_id -> weight for action tokens
+        self.action_token_weights = action_token_weights
+
 class LlavaAttLlamaModel(UniNaVIDMetaModel, LlamaModel):
     config_class = LlavaConfig
 
@@ -49,6 +54,10 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
         self.model = LlavaAttLlamaModel(config)
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Cache for token weights (created once and reused)
+        self._token_weights_cache = None
+
         self.post_init()
 
     def get_model(self):
@@ -103,7 +112,21 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            loss_fct = CrossEntropyLoss()
+            # Create weighted loss function if action token weights are configured
+            if hasattr(self.config, 'action_token_weights') and self.config.action_token_weights is not None:
+                # Create or reuse cached weight tensor
+                if self._token_weights_cache is None:
+                    token_weights = torch.ones(self.config.vocab_size, dtype=torch.float32)
+                    for token_id, weight in self.config.action_token_weights.items():
+                        token_weights[token_id] = weight
+                    self._token_weights_cache = token_weights
+
+                # Move to correct device and dtype (match shift_logits)
+                token_weights = self._token_weights_cache.to(device=shift_logits.device, dtype=shift_logits.dtype)
+                loss_fct = CrossEntropyLoss(weight=token_weights)
+            else:
+                loss_fct = CrossEntropyLoss()
+
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
 
